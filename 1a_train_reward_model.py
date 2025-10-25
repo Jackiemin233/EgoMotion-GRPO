@@ -1,5 +1,7 @@
 """Training script for EgoAllo diffusion model using HuggingFace accelerate."""
 
+
+
 import dataclasses
 import shutil
 from pathlib import Path

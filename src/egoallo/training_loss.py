@@ -12,7 +12,9 @@ from torch.nn.parallel import DistributedDataParallel
 from . import network
 from .data.amass import EgoTrainingData
 from .sampling import CosineNoiseScheduleConstants
-from .transforms import SO3
+from .transforms import SO3, SE3
+
+import math
 
 
 @dataclasses.dataclass(frozen=True)
@@ -30,6 +32,67 @@ class TrainingLossConfig:
     )
     weight_loss_by_t: Literal["emulate_eps_pred"] = "emulate_eps_pred"
     """Weights to apply to the loss at each noise level."""
+    
+@dataclasses.dataclass(frozen=True)
+class RewardTrainingLossConfig:
+    cond_dropout_prob: float = 0.0
+    beta_coeff_weights: tuple[float, ...] = tuple(1 / (i + 1) for i in range(16))
+    loss_weights: dict[str, float] = dataclasses.field(
+        default_factory={
+            "betas": 0.1,
+            "body_rotmats": 1.0,
+            "contacts": 0.1,
+            # We don't have many hands in the AMASS dataset...
+            "hand_rotmats": 0.01,
+        }.copy
+    )
+    weight_loss_by_t: Literal["emulate_eps_pred"] = "emulate_eps_pred"
+    """Weights to apply to the loss at each noise level."""
+    
+class RewardTrainingLossComputer:
+    """Helper class for computing the training loss. Contains a single method
+    for computing a training loss."""
+    def __init__(self, config: RewardTrainingLossConfig, device: torch.device) -> None:
+        self.config = config
+        
+    def compute_reward_loss(
+        self,
+        model,
+        unwrapped_model: network.EgoDenoiser,
+        train_batch: EgoTrainingData,
+    ) -> tuple[Tensor, dict[str, Tensor | float]]:
+        """Compute a training loss for the EgoDenoiser model.
+
+        Returns:
+            A tuple (loss tensor, dictionary of things to log).
+        """
+        log_outputs: dict[str, Tensor | float] = {}
+
+        batch, time, num_joints, _ = train_batch.body_quats.shape
+        if unwrapped_model.config.include_hands: # Input trajectory
+            assert train_batch.hand_quats is not None
+            x_0 = network.EgoDenoiseTraj(
+                betas=train_batch.betas.expand((batch, time, 16)),
+                body_rotmats=SO3(train_batch.body_quats).as_matrix(),
+                contacts=train_batch.contacts,
+                hand_rotmats=SO3(train_batch.hand_quats).as_matrix(),
+            )
+        else:
+            x_0 = network.EgoDenoiseTraj(
+                betas=train_batch.betas.expand((batch, time, 16)),
+                body_rotmats=SO3(train_batch.body_quats).as_matrix(),
+                contacts=train_batch.contacts,
+                hand_rotmats=None,
+            )
+            
+        # reward model forward
+        reward_scores = model(x_0)
+        
+        # Related loss computation can be added here
+        
+        
+        
+        
 
 
 class TrainingLossComputer:
@@ -43,6 +106,9 @@ class TrainingLossComputer:
             .to(device)
             .map(lambda tensor: tensor.to(torch.float32))
         )
+        self.adv_clip_max = 5
+        self.clip_range = 1e-4
+        
 
         # Emulate loss weight that would be ~equivalent to epsilon prediction.
         #
@@ -91,13 +157,13 @@ class TrainingLossComputer:
         assert x_0_packed.shape == (batch, time, unwrapped_model.get_d_state())
 
         # Diffuse.
-        t = torch.randint(
+        t = torch.randint( # construct timesteps
             low=1,
             high=unwrapped_model.config.max_t + 1,
             size=(batch,),
             device=device,
         )
-        eps = torch.randn(x_0_packed.shape, dtype=x_0_packed.dtype, device=device)
+        eps = torch.randn(x_0_packed.shape, dtype=x_0_packed.dtype, device=device) # random noise
         assert self.noise_constants.alpha_bar_t.shape == (
             unwrapped_model.config.max_t + 1,
         )
@@ -131,8 +197,8 @@ class TrainingLossComputer:
         x_0_packed_pred = model.forward(
             x_t_packed=x_t_packed,
             t=t,
-            T_world_cpf=train_batch.T_world_cpf,
-            T_cpf_tm1_cpf_t=train_batch.T_cpf_tm1_cpf_t,
+            T_world_cpf=train_batch.T_world_cpf, # [256 128 7]
+            T_cpf_tm1_cpf_t=train_batch.T_cpf_tm1_cpf_t, # [256 128 7]
             hand_positions_wrt_cpf=hand_positions_wrt_cpf,
             project_output_rotmats=False,
             mask=train_batch.mask,
@@ -253,3 +319,99 @@ class TrainingLossComputer:
         log_outputs["train_loss"] = loss
 
         return loss, log_outputs
+    
+    def compute_denoising_loss_grpo(
+        self,
+        model: network.EgoDenoiser | DistributedDataParallel | OptimizedModule,
+        unwrapped_model: network.EgoDenoiser,
+        sample_batch: EgoTrainingData,
+    ):
+        
+        log_outputs: dict[str, Tensor | float] = {}
+        
+        batch_size, seq_len, _ = sample_batch['packed_traj'].shape
+        
+        Ts_world_cpf = sample_batch['conditions']
+        
+        Ts_cpf_tm1_cpf_t = (
+            SE3(Ts_world_cpf[..., :-1, :]).inverse() @ SE3(Ts_world_cpf[..., 1:, :])
+        ).wxyz_xyz
+
+        device = sample_batch['packed_traj'].device
+        
+        x_t_packed = sample_batch['packed_traj'] 
+        
+        assert sample_batch['packed_traj'].shape == (batch_size, seq_len, unwrapped_model.get_d_state())
+        
+        x_0_packed_pred = model.forward(
+            x_t_packed=x_t_packed,
+            t=sample_batch['timesteps'],
+            T_world_cpf=Ts_world_cpf[:, :-1], #[256, 128, 7]
+            T_cpf_tm1_cpf_t=Ts_cpf_tm1_cpf_t, #
+            hand_positions_wrt_cpf=None,
+            project_output_rotmats=False,
+            mask=None, #train_batch.mask,
+            cond_dropout_keep_mask=torch.rand((batch_size,), device=device)
+            > self.config.cond_dropout_prob
+            if self.config.cond_dropout_prob > 0.0
+            else None,
+        )
+        
+        # compute the log prob of next_latents given latents under the current model
+        alpha_bar_t = self.noise_constants.alpha_bar_t
+        alpha_t = self.noise_constants.alpha_t
+        
+        sigma_t = torch.cat(
+            [
+                torch.zeros((1,), device=device),
+                torch.sqrt(
+                    (1.0 - alpha_bar_t[:-1]) / (1 - alpha_bar_t[1:]) * (1 - alpha_t)
+                )
+                * 0.8, # (hyperparameter: eta)
+            ]
+        )
+        
+        t = sample_batch['timesteps'] # current timestep
+        t_next = torch.clamp(torch.sqrt(sample_batch['timesteps']).long() - 1, max=30) ** 2 # next timestep
+        
+        x_t_packed_wonoise = (
+            torch.sqrt(alpha_bar_t[t_next])[:,None, None] * x_0_packed_pred
+            + (
+                torch.sqrt(1 - alpha_bar_t[t_next] - sigma_t[t] ** 2)[:, None, None]
+                * (x_t_packed - torch.sqrt(alpha_bar_t[t])[:, None, None] * x_0_packed_pred)
+                / torch.sqrt(1 - alpha_bar_t[t] + 1e-1)[:, None, None]
+            )
+        )
+        
+        x_t_packed = (
+            x_t_packed_wonoise
+            + sigma_t[t][:, None, None] * torch.randn(x_0_packed_pred.shape, device=device) # Random noise
+        )
+        
+        
+        # log prob of prev_sample given prev_sample_mean and Sigma_t
+        log_prob = (
+            -((x_t_packed.detach() - x_t_packed_wonoise) ** 2) / (2 * (sigma_t[t] **2))[:, None, None]
+            - torch.log(sigma_t[t])[:, None, None]
+            - torch.log(torch.sqrt(2 * torch.as_tensor(math.pi)))
+        )
+        
+        # mean along all but batch dimension
+        log_prob = log_prob.mean(dim=tuple(range(1, log_prob.ndim)))
+        
+        # ppo logic
+        advantages = torch.clamp(
+            sample_batch["final_advantages"],
+            -self.adv_clip_max,
+            self.adv_clip_max,
+        )
+        ratio = torch.exp(log_prob - sample_batch["log_probs"])
+        unclipped_loss = -advantages * ratio
+        clipped_loss = -advantages * torch.clamp(
+            ratio,
+            1.0 - self.clip_range,
+            1.0 + self.clip_range,
+        )
+        loss = torch.mean(torch.maximum(unclipped_loss, clipped_loss))
+        
+        return loss#, ratio

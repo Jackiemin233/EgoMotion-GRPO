@@ -517,6 +517,7 @@ def process_seq(
     beta_neutral: bool,
     reflect: bool = False,
     overwrite: bool = False,
+    config = None,
     **kwargs,
 ):
     if not overwrite and os.path.isfile(out_path):
@@ -525,7 +526,15 @@ def process_seq(
 
     guru.info(f"process {input_path} to {out_path}")
 
-    model_vars, meta = load_seq_smpl_params(input_path)
+    model_vars, meta = load_seq_smpl_params(input_path) # TODO: 10.17 Update here
+    
+    model_vars['root_orient'] = model_vars['root_orient'] + np.random.randn(*model_vars['root_orient'].shape) * config.noise_var_root_pose
+    model_vars['pose_body'] = model_vars['pose_body'] + np.random.randn(*model_vars['pose_body'].shape) * config.noise_var_pose
+    model_vars['betas'] = model_vars['betas'] + np.random.randn(*model_vars['betas'].shape) * config.noise_var_shap
+        
+    # model_vars['root_orient'] = model_vars['root_orient'] + torch.rand_like(model_vars['root_orient']) * config.noise_var_root_pose
+    # model_vars['pose_body'] = model_vars['pose_body'] + torch.rand_like(model_vars['pose_body']) * config.noise_var_pose
+    # model_vars['betas'] = model_vars['betas'] + torch.rand_like(model_vars['betas']) * config.noise_var_shap
 
     if beta_neutral:  # get the gender neutral beta
         guru.info("converting betas to gender neutral")
@@ -731,8 +740,16 @@ class Config:
     """Where the AMASS dataset is stored."""
 
     smplh_root: str = "./data/smplh"
-    out_root: str = "./data/processed_30fps_no_skating/"
+    out_root: str = "./data/processed_30fps_noised_no_skating/"
     devices: tuple[int, ...] = (0,)
+    
+    """Set the noise level for reward model training data."""
+    noise_var_shap: float = 0.05             # computed from test error distribution on ARCTIC
+    noise_var_expr: float = 0.01
+    noise_var_pose : float = 0.05
+    noise_var_root_pose : float = 0.02
+    
+    
     """CUDA devices. We use CPU if not available."""
     overwrite: bool = False
 
@@ -777,6 +794,7 @@ def main(cfg: Config):
                 beta_neutral=True,
                 reflect=False,
                 overwrite=cfg.overwrite,
+                config = Config
             )
             process_seq(
                 path,
@@ -786,6 +804,7 @@ def main(cfg: Config):
                 beta_neutral=True,
                 reflect=True,
                 overwrite=cfg.overwrite,
+                config = Config
             )
         return
 

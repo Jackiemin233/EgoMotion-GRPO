@@ -91,7 +91,7 @@ class EgoAmassHdf5Dataset(torch.utils.data.Dataset[EgoTrainingData]):
             self._groups = [
                 p
                 for p in file_list_path.read_text().splitlines()
-                if p.partition("/")[0] in datasets
+                if p.split("/")[2] in datasets # Change 0 to 2 to get the folder name || p.partition("/")[0]
                 and cast(
                     h5py.Dataset,
                     cast(h5py.Group, hdf5_file[p])["T_world_root"],

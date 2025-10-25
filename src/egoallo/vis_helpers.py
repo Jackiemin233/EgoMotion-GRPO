@@ -17,6 +17,11 @@ from .hand_detection_structs import (
     CorrespondedAriaHandWristPoseDetections,
     CorrespondedHamerDetections,
 )
+
+from egoallo.fncsmpl_extensions import get_T_world_root_from_cpf_pose
+import open3d as o3d
+
+
 from .transforms import SE3, SO3
 
 
@@ -583,3 +588,54 @@ def visualize_traj_and_hand_detections(
             return gui_timestep.value
 
     return loop_cb
+
+def expand_faces_for_batch(faces: torch.Tensor, B: int, N: int):
+    """
+    faces: [F, 3], Single faces
+    B: batch size
+    N: vertices number
+    """
+    all_faces = []
+    for b in range(B):
+        offset = b * N
+        all_faces.append(faces + offset)
+    return np.vstack(all_faces)  # [B*F, 3]
+
+
+def vis_meshes(samples, T_world_cpf, body_model, vis_interval = 5,  batch_index = 0, save_path = None):
+    # Select batch index
+    sample = samples[batch_index]
+    T_world_cpf = T_world_cpf[batch_index]
+    # The last timestep
+    sample = network.EgoDenoiseTraj.unpack(sample[-1], include_hands=True) 
+    
+    # single motions
+    pred_mesh = get_bodymesh_sample(sample, T_world_cpf, body_model)
+    
+    pred_mesh_verts = pred_mesh.verts[::vis_interval].cpu().detach() # [7, 6890, 3]
+    pred_mesh_faces = pred_mesh.faces.cpu().detach() #[48230, 3]
+    pred_mesh_faces = expand_faces_for_batch(pred_mesh_faces, B = pred_mesh_verts.shape[0] , N = pred_mesh_verts.shape[1])
+    
+    # mesh1
+    motion = o3d.geometry.TriangleMesh()
+    motion.vertices = o3d.utility.Vector3dVector(pred_mesh_verts.reshape(-1, 3))
+    motion.triangles = o3d.utility.Vector3iVector(pred_mesh_faces)
+    
+    o3d.io.write_triangle_mesh(save_path, motion, write_vertex_colors=True)
+
+def get_bodymesh_sample(samples, T_world_cpf, body_model):
+    
+    # pred result
+    pred_posed = body_model.with_shape(samples.betas).with_pose(
+        T_world_root=SE3.identity(samples.betas.device, torch.float32).wxyz_xyz,
+        local_quats=SO3.from_matrix(
+            torch.cat([samples.body_rotmats, samples.hand_rotmats], dim=1)
+        ).wxyz,
+    )
+    pred_posed = pred_posed.with_new_T_world_root(
+        get_T_world_root_from_cpf_pose(pred_posed, T_world_cpf[1:, ...])
+    )
+    
+    pred_mesh = pred_posed.lbs()
+    
+    return pred_mesh

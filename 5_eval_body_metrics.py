@@ -20,6 +20,13 @@ For --subseq-len 32:
      T_head 0.006 +/- 0.000              (in paper: 0.0064 +/- 0.0001)
      foot_contact (GND) 0.985 +/- 0.003  (in paper: 0.98 +/- 0.00)
      foot_skate 0.185 +/- 0.005          (not reported in paper)
+     
+'''
+python 5_eval_body_metrics.py --dataset-files-path ./data/egoalgo_no_skating_dataset_files.txt --dataset-hdf5-path ./data/egoalgo_no_skating_dataset.hdf5
+
+'''     
+
+     
 """
 
 from pathlib import Path
@@ -40,8 +47,10 @@ from egoallo.metrics_helpers import (
     compute_head_trans,
     compute_mpjpe,
 )
-from egoallo.sampling import run_sampling_with_stitching
+from egoallo.data.dataclass import collate_dataclass
+from egoallo.sampling import run_sampling_with_stitching, run_sampling_with_logprob
 from egoallo.transforms import SE3, SO3
+from egoallo.rewardmodel import get_joints
 
 
 def main(
@@ -68,14 +77,44 @@ def main(
         slice_strategy="deterministic",
         random_variable_len_proportion=0.0,
     )
+    data_loader = torch.utils.data.DataLoader(
+        dataset=dataset,
+        batch_size=64,
+        shuffle=True,
+        num_workers=8,
+        persistent_workers=False,
+        pin_memory=True,
+        collate_fn=collate_dataclass,
+        drop_last=True,
+    )
+    
+    
     body_model = fncsmpl.SmplhModel.load(smplh_npz_path).to(device)
 
     metrics = list[dict[str, np.ndarray]]()
+    
+    for sequence in data_loader:
+        sequence = sequence.to(device)
 
-    for i in range(len(dataset)):
-        sequence = dataset[i].to(device)
+    # for i in range(len(dataset)):
+    #     sequence = dataset[i].to(device)
 
-        samples = run_sampling_with_stitching(
+        # samples = run_sampling_with_stitching(
+        #     denoiser_network,
+        #     body_model=body_model,
+        #     guidance_mode="no_hands",
+        #     guidance_inner=guidance_inner,
+        #     guidance_post=False,
+        #     Ts_world_cpf=sequence.T_world_cpf,
+        #     hamer_detections=None,
+        #     aria_detections=None,
+        #     num_samples=1,
+        #     floor_z=0.0,
+        #     device=device,
+        #     guidance_verbose=False,
+        # )
+        
+        samples, _ = run_sampling_with_logprob(
             denoiser_network,
             body_model=body_model,
             guidance_mode="no_hands",
@@ -84,12 +123,12 @@ def main(
             Ts_world_cpf=sequence.T_world_cpf,
             hamer_detections=None,
             aria_detections=None,
-            num_samples=num_samples,
+            num_samples=1,
             floor_z=0.0,
             device=device,
             guidance_verbose=False,
         )
-
+        
         assert samples.hand_rotmats is not None
         assert samples.betas.shape == (num_samples, subseq_len, 16)
         assert samples.body_rotmats.shape == (num_samples, subseq_len, 21, 3, 3)

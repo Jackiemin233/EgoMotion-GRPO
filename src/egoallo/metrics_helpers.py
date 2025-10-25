@@ -11,13 +11,15 @@ from .transforms import SO3
 
 def compute_foot_skate(
     pred_Ts_world_joint: Float[Tensor, "num_samples time 21 7"],
+    return_tensor: bool = False,
 ) -> np.ndarray:
     (num_samples, time) = pred_Ts_world_joint.shape[:2]
 
     # Drop the person to the floor.
     # This is necessary for the foot skating metric to make sense for floating people...!
     pred_Ts_world_joint = pred_Ts_world_joint.clone()
-    pred_Ts_world_joint[..., 6] -= torch.min(pred_Ts_world_joint[..., 6])
+    for i in range(num_samples):
+        pred_Ts_world_joint[i, ..., 6] -= torch.min(pred_Ts_world_joint[i, ..., 6])
 
     foot_indices = torch.tensor([6, 7, 9, 10], device=pred_Ts_world_joint.device)
 
@@ -42,7 +44,7 @@ def compute_foot_skate(
     # Threshold.
     foot_positions_diff_norm = foot_positions_diff_norm * (
         foot_positions[..., 1:, :, 2] < H_thresh
-    )
+    ).to(torch.float32)
     fs_per_sample = torch.sum(
         torch.sum(
             foot_positions_diff_norm
@@ -53,7 +55,10 @@ def compute_foot_skate(
     )
     assert fs_per_sample.shape == (num_samples,)
 
-    return fs_per_sample.numpy(force=True)
+    if return_tensor:
+        return fs_per_sample
+    else: 
+        return fs_per_sample.numpy(force=True)
 
 
 def compute_foot_contact(

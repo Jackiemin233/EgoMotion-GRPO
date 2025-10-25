@@ -169,7 +169,7 @@ class JaxGuidanceParams:
     skate_weight: float = 30.0
 
     # Note: this should be quite high. If the hand quaternions aren't
-    # constrained enough the reprojecction loss can get wild.
+    # constrained enough the reprojection loss can get wild.
     hand_quats: jdc.Static[bool] = True
     hand_quat_weight = 5.0
 
