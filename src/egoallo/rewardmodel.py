@@ -11,7 +11,7 @@ from egoallo.metrics_helpers import (
     compute_foot_contact,
     compute_foot_skate,
     compute_head_trans,
-    compute_mpjpe,
+    compute_mpjpe_reward,
 )
 
 device = torch.device("cuda")
@@ -35,27 +35,26 @@ def get_joints(samples, batch, body_model):
         ).wxyz,
     )
     pred_posed = pred_posed.with_new_T_world_root(
-        get_T_world_root_from_cpf_pose(pred_posed, batch[:, 1:, ...])
+        get_T_world_root_from_cpf_pose(pred_posed, batch.T_world_cpf[:, 1:, ...])
     )
     
     # gt
-    label_posed = None
-    # label_posed = body_model.with_shape(batch.betas[:, 1:, ...]).with_pose(
-    #     batch.T_world_root[:, 1:, ...],
-    #     torch.cat(
-    #         [
-    #             batch.body_quats[:, 1:, ...],
-    #             batch.hand_quats[:, 1:, ...],
-    #         ],
-    #         dim=2,
-    #     ),
-    # )
+    label_posed = body_model.with_shape(batch.betas[:, 1:, ...]).with_pose(
+        batch.T_world_root[:, 1:, ...],
+        torch.cat(
+            [
+                batch.body_quats[:, 1:, ...],
+                batch.hand_quats[:, 1:, ...],
+            ],
+            dim=2,
+        ),
+    )
 
     return pred_posed, label_posed
 
 
 
-def compute_rewards(samples: torch.Tensor, batch: torch.Tensor, body_model) -> torch.Tensor:
+def compute_rewards(samples: torch.Tensor, batch, body_model) -> torch.Tensor:
     """ Compute rewards for the given samples and batch data.
 
     Args:
@@ -69,6 +68,22 @@ def compute_rewards(samples: torch.Tensor, batch: torch.Tensor, body_model) -> t
     # get the reward
     batch_size = samples[0].betas.shape[0]
     
-    foot_skate_reward = compute_foot_skate(pred_Ts_world_joint=pred_joints.Ts_world_joint[:, :, :21, :], return_tensor=True)
+    #foot_skate_reward = compute_foot_skate(pred_Ts_world_joint=pred_joints.Ts_world_joint[:, :, :21, :], return_tensor=True)
     
-    return foot_skate_reward
+    mpjpe_reward = compute_mpjpe_reward(
+        label_T_world_root=label_joints.T_world_root,
+        label_Ts_world_joint=label_joints.Ts_world_joint[:, :, :21, :],
+        pred_T_world_root=pred_joints.T_world_root,
+        pred_Ts_world_joint=pred_joints.Ts_world_joint[:, :, :21, :],
+        per_frame_procrustes_align=False,
+    )
+    
+    pampjpe_reward = compute_mpjpe_reward(
+        label_T_world_root=label_joints.T_world_root,
+        label_Ts_world_joint=label_joints.Ts_world_joint[:, :21, :],
+        pred_T_world_root=pred_joints.T_world_root,
+        pred_Ts_world_joint=pred_joints.Ts_world_joint[:, :, :21, :],
+        per_frame_procrustes_align=True,
+    ),
+    
+    return mpjpe_reward # foot_skate_reward

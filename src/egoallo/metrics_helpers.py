@@ -115,6 +115,47 @@ def compute_head_trans(
         torch.linalg.norm(errors, dim=-1),
         dim=-1,
     ).numpy(force=True)
+    
+def compute_mpjpe_reward(
+    label_T_world_root: Float[Tensor, "batch time 7"],
+    label_Ts_world_joint: Float[Tensor, "batch 21 7"],
+    pred_T_world_root: Float[Tensor, "batch time 7"],
+    pred_Ts_world_joint: Float[Tensor, "batch time 21 7"],
+    per_frame_procrustes_align: bool,
+) -> np.ndarray:
+    num_samples, time, _, _ = pred_Ts_world_joint.shape
+
+    # Concatenate the world root to the joints.
+    label_Ts_world_joint = torch.cat(
+        [label_T_world_root[..., None, :], label_Ts_world_joint], dim=-2
+    )
+    pred_Ts_world_joint = torch.cat(
+        [pred_T_world_root[..., None, :], pred_Ts_world_joint], dim=-2
+    )
+    del label_T_world_root, pred_T_world_root
+
+    pred_joint_positions = pred_Ts_world_joint[:, :, :, 4:7]
+    label_joint_positions = label_Ts_world_joint[:, :, :, 4:7]
+
+    if per_frame_procrustes_align:
+        pred_joint_positions = procrustes_align(
+            points_y=pred_joint_positions,
+            points_x=label_joint_positions,
+            output="aligned_x",
+        )
+
+    position_differences = pred_joint_positions - label_joint_positions
+    assert position_differences.shape == (num_samples, time, 22, 3)
+
+    # Per-joint position errors, in millimeters.
+    pjpe = torch.linalg.norm(position_differences, dim=-1) * 1000.0
+    assert pjpe.shape == (num_samples, time, 22)
+
+    # Mean per-joint position errors.
+    mpjpe = torch.mean(pjpe.reshape((num_samples, -1)), dim=-1)
+    assert mpjpe.shape == (num_samples,)
+
+    return mpjpe
 
 
 def compute_mpjpe(

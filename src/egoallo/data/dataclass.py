@@ -12,7 +12,6 @@ from .. import fncsmpl, fncsmpl_extensions
 from .. import transforms as tf
 from ..tensor_dataclass import TensorDataclass
 
-
 class EgoTrainingData(TensorDataclass):
     """Dictionary of tensors we use for EgoAllo training."""
 
@@ -53,7 +52,30 @@ class EgoTrainingData(TensorDataclass):
 
     hand_quats: Float[Tensor, "*#batch timesteps 30 4"] | None
     """Local orientations for each hand joint."""
-
+    
+    def expand_sequence(self, expand_len: int) -> EgoTrainingData:
+        """Expand each sequence by repeating each batch"""
+        keys = vars(self).keys()
+        expanded_data = {
+            k: getattr(self, k).repeat_interleave(expand_len, dim=0)
+            for k in keys
+        }
+        return EgoTrainingData(**expanded_data)
+    
+    def slice_batch(self, index: slice | int | list[int] | torch.Tensor) -> "EgoTrainingData":
+        """Slice each attribute along the batch dimension (dim=0)."""
+        sliced_data = {}
+        for key, value in self.__dict__.items():
+            if value is None:
+                sliced_data[key] = None
+            elif isinstance(value, torch.Tensor):
+                sliced_data[key] = value[index]
+            else:
+                sliced_data[key] = value
+        
+        return EgoTrainingData(**sliced_data)
+        
+    
     @staticmethod
     def load_from_npz(
         body_model: fncsmpl.SmplhModel,

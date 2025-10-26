@@ -58,7 +58,7 @@ def main(
     dataset_files_path: Path,
     subseq_len: int = 128,
     guidance_inner: bool = False,
-    checkpoint_dir: Path = Path("./egoallo_checkpoint_april13/checkpoints_3000000/"),
+    checkpoint_dir: Path = Path('/home/yaonanjie/project10/egoallo/experiments/debug/v20/checkpoints_445'), #Path("./egoallo_checkpoint_april13/checkpoints_3000000/"),
     smplh_npz_path: Path = Path("./data/smplh/neutral/model.npz"),
     num_samples: int = 1,
 ) -> None:
@@ -93,33 +93,18 @@ def main(
 
     metrics = list[dict[str, np.ndarray]]()
     
-    for sequence in data_loader:
-        sequence = sequence.to(device)
+    # for sequence in data_loader:
+    #     sequence = sequence.to(device)
 
-    # for i in range(len(dataset)):
-    #     sequence = dataset[i].to(device)
+    for i in range(len(dataset)):
+        sequence = dataset[i].to(device)
 
-        # samples = run_sampling_with_stitching(
-        #     denoiser_network,
-        #     body_model=body_model,
-        #     guidance_mode="no_hands",
-        #     guidance_inner=guidance_inner,
-        #     guidance_post=False,
-        #     Ts_world_cpf=sequence.T_world_cpf,
-        #     hamer_detections=None,
-        #     aria_detections=None,
-        #     num_samples=1,
-        #     floor_z=0.0,
-        #     device=device,
-        #     guidance_verbose=False,
-        # )
-        
-        samples, _ = run_sampling_with_logprob(
+        samples = run_sampling_with_stitching(
             denoiser_network,
             body_model=body_model,
             guidance_mode="no_hands",
             guidance_inner=guidance_inner,
-            guidance_post=True,
+            guidance_post=False,
             Ts_world_cpf=sequence.T_world_cpf,
             hamer_detections=None,
             aria_detections=None,
@@ -128,6 +113,21 @@ def main(
             device=device,
             guidance_verbose=False,
         )
+        
+        # samples, _ = run_sampling_with_logprob(
+        #     denoiser_network,
+        #     body_model=body_model,
+        #     guidance_mode="no_hands",
+        #     guidance_inner=guidance_inner,
+        #     guidance_post=True,
+        #     Ts_world_cpf=sequence.T_world_cpf,
+        #     hamer_detections=None,
+        #     aria_detections=None,
+        #     num_samples=1,
+        #     floor_z=0.0,
+        #     device=device,
+        #     guidance_verbose=False,
+        # )
         
         assert samples.hand_rotmats is not None
         assert samples.betas.shape == (num_samples, subseq_len, 16)

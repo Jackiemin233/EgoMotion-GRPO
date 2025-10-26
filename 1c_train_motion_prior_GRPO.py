@@ -53,7 +53,7 @@ class EgoAlloTrainConfig:
     num_inner_epochs: int = 1
     
     # Dataset arguments.
-    batch_size: int = 64
+    batch_size: int = 32
     """Effective batch size."""
     num_workers: int = 4
     subseq_len: int = 128
@@ -74,7 +74,7 @@ class EgoAlloTrainConfig:
     max_grad_norm: float = 1.0
     
     # training related
-    save_ckpt_freq = 5
+    save_ckpt_freq = 100
     save_vis_freq = 5
     
     # visualization related
@@ -171,15 +171,19 @@ def run_training(
         lr=config.learning_rate,
         weight_decay=config.weight_decay,
     )
-    scheduler = torch.optim.lr_scheduler.LambdaLR(
-        optim, lr_lambda=lambda step: min(1.0, step / config.warmup_steps)
-    )
+    # scheduler = torch.optim.lr_scheduler.LambdaLR(
+    #     optim, lr_lambda=lambda step: min(1.0, step / config.warmup_steps)
+    # )
 
     # HF accelerate setup. We use this for parallelism, etc!
-    model, train_loader, optim, scheduler = accelerator.prepare(
-        model, train_loader, optim, scheduler
+    model, train_loader, optim = accelerator.prepare(
+        model, train_loader, optim
     )
-    accelerator.register_for_checkpointing(scheduler)
+        
+    # model, train_loader, optim, scheduler = accelerator.prepare(
+    #     model, train_loader, optim, scheduler
+    # )
+    #accelerator.register_for_checkpointing(scheduler)
 
     # Restore an existing model checkpoint.
     if restore_checkpoint_dir is not None:
@@ -191,7 +195,7 @@ def run_training(
     ):
         epoch = int(restore_checkpoint_dir.name.partition("_")[2])
     else:
-        epoch = int(scheduler.state_dict()["last_epoch"])
+        epoch = 0
         assert epoch == 0 or restore_checkpoint_dir is not None, epoch
 
     # Save an initial checkpoint. Not a big deal but currently this has an
@@ -207,31 +211,27 @@ def run_training(
         # GRPO Sampling
         for epoch, train_batch in enumerate(train_loader):
             # Sampling Stage
-        
             # Repeat n times for GRPO
             batch_size = config.batch_size
             
-            expanded_sequences = []
+            train_batch = train_batch.expand_sequence(config.group_size)
             
-            for i in range(batch_size):
-                expanded_sequences.extend([train_batch.T_world_cpf[i]] * config.group_size)
+            expanded_sequences = train_batch.T_world_cpf        
             
             all_log_probs = []
             all_rewards = []
             all_samples = []
             
             for i in tqdm(range(0, len(expanded_sequences), batch_size), desc=f'Sampling Epoch = {epoch}'): # 
-                current_batch = expanded_sequences[i:i+batch_size]
+                current_batch = train_batch.slice_batch(slice(i, i+batch_size))
                 
-                current_batch = torch.stack(current_batch, dim=0).to(device)
-
                 samples, samples_packed, logprobs = run_sampling_with_logprob( # Samples -> all_latents
                     model,
                     body_model=body_model,
                     guidance_mode="no_hands",
                     guidance_inner=False,
                     guidance_post=False,
-                    Ts_world_cpf=current_batch,
+                    Ts_world_cpf=current_batch.T_world_cpf,
                     hamer_detections=None,
                     aria_detections=None,
                     num_samples=1,
@@ -253,16 +253,17 @@ def run_training(
             all_samples = torch.cat(all_samples, dim=0).detach()
             all_log_probs = torch.cat(all_log_probs, dim=0).detach()
             all_rewards = torch.cat(all_rewards, dim=0).to(torch.float32)
+            all_rewards = -all_rewards 
             timesteps = quadratic_ts(return_tensor=True, set_final_step=True).to(device=device).repeat(config.batch_size * config.group_size, 1) 
-            conditions = torch.stack(expanded_sequences, dim=0).to(device)
+            conditions = train_batch.T_world_cpf.to(device)
             
             if epoch % config.save_vis_freq == 0:
                 vis_meshes(all_samples, conditions, body_model, config.vis_interval, save_path = f'{experiment_dir}/visualization/{epoch}.obj')
             
             
             samples_dict={
-                "conditions": conditions,
-                "timesteps": timesteps[:, :-2],
+                "conditions": conditions, # [batch, seq_len, 7]
+                "timesteps": timesteps[:, :-2], # [batch, 29]
                 "packed_traj": all_samples[:, :-1][:, :-1],  # each entry is the latent before timestep t (0, 29) 
                 "next_packed_traj": all_samples[:, 1:][:, :-1],  # each entry is the latent after timestep t (1, 30)
                 "log_probs": all_log_probs[:, :-1],
@@ -284,22 +285,22 @@ def run_training(
             samples_dict["advantages"] = advantages
             samples_dict["final_advantages"] = advantages
             
-            total_batch_size, num_timesteps = samples_dict["timesteps"].shape
+            total_batch_size, num_timesteps = samples_dict["timesteps"].shape #256, 32
             
             # model training loop
             model.train()
             for inner_epoch in range(config.num_inner_epochs):
-                # perms = torch.stack(
-                #     [
-                #         torch.randperm(num_timesteps, device=accelerator.device)
-                #         for _ in range(total_batch_size)
-                #     ]
-                # )
-                # for key in ["timesteps", "packed_traj", "next_packed_traj", "log_probs"]:
-                #     samples_dict[key] = samples_dict[key][
-                #         torch.arange(total_batch_size, device=accelerator.device)[:, None],
-                #         perms,
-                #     ]
+                perms = torch.stack(
+                    [
+                        torch.randperm(num_timesteps, device=accelerator.device)
+                        for _ in range(total_batch_size)
+                    ]
+                )
+                for key in ["timesteps", "packed_traj", "next_packed_traj", "log_probs"]:
+                    samples_dict[key] = samples_dict[key][
+                        torch.arange(total_batch_size, device=accelerator.device)[:, None],
+                        perms,
+                    ]
 
                 # rebatch for training
                 samples_batched = {
@@ -338,25 +339,22 @@ def run_training(
                             sample_batch=sample_timestep,
                         )
                 
-                        #log_outputs["learning_rate"] = scheduler.get_last_lr()[0]
-                        #accelerator.log(log_outputs, step=step)
-                        #print(loss.item())
                         accelerator.backward(loss)
                         if accelerator.sync_gradients:
                             accelerator.clip_grad_norm_(model.parameters(), config.max_grad_norm)
                         optim.step()
-                        scheduler.step()
+                        #scheduler.step()
                         optim.zero_grad(set_to_none=True)
                         
-                    # Print status update to terminal.
-                    mem_free, mem_total = torch.cuda.mem_get_info()
-                    logger.info(
-                        #f"step: {step} ({loop_metrics.iterations_per_sec:.2f} it/sec)"
-                        f" mem: {(mem_total - mem_free) / 1024**3:.2f}/{mem_total / 1024**3:.2f}G"
-                        f" lr: {scheduler.get_last_lr()[0]:.7f}"
-                        f" loss: {loss.item():.6f}"
-                        f" reward: {all_rewards.mean().item():.6f}"
-                    )
+                # Print status update to terminal.
+                mem_free, mem_total = torch.cuda.mem_get_info()
+                logger.info(
+                    #f"step: {step} ({loop_metrics.iterations_per_sec:.2f} it/sec)"
+                    f" mem: {(mem_total - mem_free) / 1024**3:.2f}/{mem_total / 1024**3:.2f}G"
+                    #f" lr: {scheduler.get_last_lr()[0]:.7f}"
+                    f" loss: {loss.item():.6f}"
+                    f" reward: {all_rewards.mean().item():.6f}"
+                )
 
             # Checkpointing.
             if epoch % config.save_ckpt_freq == 0:
