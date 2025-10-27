@@ -244,8 +244,6 @@ def run_sampling_with_logprob(
     denoiser_network: network.EgoDenoiser,
     body_model: fncsmpl.SmplhModel,
     guidance_mode: GuidanceMode,
-    guidance_post: bool,
-    guidance_inner: bool,
     Ts_world_cpf: Float[Tensor, "batch time 7"],
     floor_z: float,
     hamer_detections: None | CorrespondedHamerDetections,
@@ -270,11 +268,11 @@ def run_sampling_with_logprob(
     ).wxyz_xyz
 
     x_t_packed = torch.randn(
-        (batch_size, num_samples, Ts_world_cpf.shape[1] - 1, denoiser_network.get_d_state()),
-        device=device,
-    )
+        (batch_size * num_samples, Ts_world_cpf.shape[1] - 1, denoiser_network.get_d_state()),
+        device=device, 
+    ) 
     
-    x_t_list = [
+    x_t_list = [ # unpacked tensor list
         network.EgoDenoiseTraj.unpack(
             x_t_packed, include_hands=denoiser_network.config.include_hands
         )
@@ -286,10 +284,8 @@ def run_sampling_with_logprob(
     
     ts = quadratic_ts()
 
-    seq_len = x_t_packed.shape[2]
-
-    start_time = None
-
+    seq_len = x_t_packed.shape[1]
+    
     window_size = 128
     overlap_size = 32
     canonical_overlap_weights = (
@@ -308,40 +304,38 @@ def run_sampling_with_logprob(
     )
 
     for i in range(len(ts) - 1):# 30 # Denoising loop 
-        t = ts[i] # [1000, 1]
-        t_next = ts[i + 1] # [841, 0]
+        t = ts[i] # [1000, 1] [1000, 4]
+        t_next = ts[i + 1] # [841, 0] [1000, 1]
 
         with torch.inference_mode():
             x_0_packed_pred = torch.zeros_like(x_t_packed)
-            overlap_weights = torch.zeros((batch_size, num_samples, seq_len, 1), device=x_t_packed.device)
+            overlap_weights = torch.zeros((batch_size * num_samples, seq_len, 1), device=x_t_packed.device)
 
             for start_t in range(0, seq_len, window_size - overlap_size):
                 end_t = min(start_t + window_size, seq_len)
                 assert end_t - start_t > 0
-                overlap_weights_slice = canonical_overlap_weights[None, None, : end_t - start_t, None]
+                overlap_weights_slice = canonical_overlap_weights[None, : end_t - start_t, None]
 
-                overlap_weights[:, :, start_t:end_t, :] += overlap_weights_slice
-                x_0_packed_pred[:, :, start_t:end_t, :] += ( # x_0_packed_pred: denoised trajectory
+                overlap_weights[:, start_t:end_t, :] += overlap_weights_slice
+                x_0_packed_pred[:, start_t:end_t, :] += ( # x_0_packed_pred: denoised trajectory
                     denoiser_network.forward(
-                        x_t_packed[:, :, start_t:end_t, :].reshape(batch_size * num_samples, end_t - start_t, -1), # x_t 
+                        x_t_packed[:, start_t:end_t, :].reshape(batch_size * num_samples, end_t - start_t, -1), # x_t 
                         
                         torch.tensor([t], device=device).expand((batch_size * num_samples,)), # noise level tensor
                         
-                        T_cpf_tm1_cpf_t=T_cpf_tm1_cpf_t[:, None, start_t:end_t, :]
-                        .expand(-1, num_samples, -1, -1)
+                        T_cpf_tm1_cpf_t=T_cpf_tm1_cpf_t[:, start_t:end_t, :]
                         .reshape(batch_size * num_samples, end_t - start_t, 7), # T_world_cpf [256, 127, 7]
                         
                         T_world_cpf=Ts_world_cpf_shifted[
-                            :, None, start_t + 1 : end_t + 1, :
+                            :, start_t + 1 : end_t + 1, :
                         ] 
-                        .expand(-1, num_samples, -1, -1)
                         .reshape(batch_size * num_samples, end_t - start_t, 7),  # shifted T_world_cpf [256, 127, 7]
                         
                         project_output_rotmats=False,
                         hand_positions_wrt_cpf=None,
                         mask=None,
                     )
-                    .reshape(batch_size, num_samples, end_t - start_t, -1)
+                    .reshape(batch_size * num_samples, end_t - start_t, -1)
                     * overlap_weights_slice
                 )
 
@@ -350,10 +344,7 @@ def run_sampling_with_logprob(
                 x_0_packed_pred.reshape(batch_size * num_samples, seq_len, -1),
                 include_hands=denoiser_network.config.include_hands,
                 project_rotmats=True,
-            ).pack().reshape(batch_size, num_samples, seq_len, -1)
-
-        if torch.any(torch.isnan(x_0_packed_pred)):
-            print("found nan", i)
+            ).pack().reshape(batch_size * num_samples, seq_len, -1)
         
         # See formula (16) from https://arxiv.org/pdf/2010.02502.pdf
         sigma_t = torch.cat(
@@ -380,14 +371,13 @@ def run_sampling_with_logprob(
         x_t_packed = (
             x_t_packed_wonoise
             + sigma_t[t] * torch.randn(x_0_packed_pred.shape, device=device) # Random noise
-        ) # no noise at last 
+        ) # no noise at last timestep
     
-        
         # Calculate the log probabilities
         # log prob of prev_sample given prev_sample_mean and Sigma_t 
         # -(zt - alphat * x) / sigma_t ^2
         log_prob = (
-            -((x_t_packed.detach() - x_t_packed_wonoise) ** 2) / (2 * (sigma_t[t]**2))
+            -((x_t_packed - x_t_packed_wonoise) ** 2) / (2 * (sigma_t[t]**2))
             - torch.log(sigma_t[t])
             - torch.log(torch.sqrt(2 * torch.as_tensor(math.pi)))
         )
@@ -402,27 +392,52 @@ def run_sampling_with_logprob(
         )
         x_t_packed_list.append(x_t_packed) # Packed tensor for each timestep
         
-        all_log_probs.append(log_prob)
+        all_log_probs.append(log_prob) # batch
             
     # Denoising loop end 
-    if guidance_mode != "off" and guidance_post:
-        constrained_traj_list = []
-        for b in range(batch_size):
-            constrained_traj = x_t_list[-1]#.get_batch(b * num_samples, (b + 1) * num_samples)
-            constrained_traj, _ = do_guidance_optimization(
-                Ts_world_cpf=Ts_world_cpf[b, 1:, :],
-                traj=constrained_traj,
-                body_model=body_model,
-                guidance_mode=guidance_mode,
-                phase="post",
-                hamer_detections=hamer_detections,
-                aria_detections=aria_detections,
-                verbose=guidance_verbose,
-            )
-            constrained_traj_list.append(constrained_traj)
-        return constrained_traj_list, x_t_list, all_log_probs
+    if return_packed:
+        return x_t_list, x_t_packed_list, all_log_probs 
     else:
-        if return_packed:
-            return x_t_list, x_t_packed_list, all_log_probs 
-        else:
-            return x_t_list, all_log_probs
+        return x_t_list, all_log_probs # for each batch
+    
+    
+    
+    
+    
+    # for i in range(len(ts) - 1):# 30 # Denoising loop 
+    #     t = ts[i] # [1000, 1]
+    #     t_next = ts[i + 1] # [841, 0]
+
+    #     with torch.inference_mode():
+    #         x_0_packed_pred = torch.zeros_like(x_t_packed)
+    #         overlap_weights = torch.zeros((batch_size, num_samples, seq_len, 1), device=x_t_packed.device)
+
+    #         for start_t in range(0, seq_len, window_size - overlap_size):
+    #             end_t = min(start_t + window_size, seq_len)
+    #             assert end_t - start_t > 0
+    #             overlap_weights_slice = canonical_overlap_weights[None, None, : end_t - start_t, None]
+
+    #             overlap_weights[:, :, start_t:end_t, :] += overlap_weights_slice
+    #             x_0_packed_pred[:, :, start_t:end_t, :] += ( # x_0_packed_pred: denoised trajectory
+    #                 denoiser_network.forward(
+    #                     x_t_packed[:, :, start_t:end_t, :].reshape(batch_size * num_samples, end_t - start_t, -1), # x_t 
+                        
+    #                     torch.tensor([t], device=device).expand((batch_size * num_samples,)), # noise level tensor
+                        
+    #                     T_cpf_tm1_cpf_t=T_cpf_tm1_cpf_t[:, None, start_t:end_t, :]
+    #                     .expand(-1, num_samples, -1, -1)
+    #                     .reshape(batch_size * num_samples, end_t - start_t, 7), # T_world_cpf [256, 127, 7]
+                        
+    #                     T_world_cpf=Ts_world_cpf_shifted[
+    #                         :, None, start_t + 1 : end_t + 1, :
+    #                     ] 
+    #                     .expand(-1, num_samples, -1, -1)
+    #                     .reshape(batch_size * num_samples, end_t - start_t, 7),  # shifted T_world_cpf [256, 127, 7]
+                        
+    #                     project_output_rotmats=False,
+    #                     hand_positions_wrt_cpf=None,
+    #                     mask=None,
+    #                 )
+    #                 .reshape(batch_size, num_samples, end_t - start_t, -1)
+    #                 * overlap_weights_slice
+    #             )

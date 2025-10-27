@@ -68,7 +68,7 @@ def compute_rewards(samples: torch.Tensor, batch, body_model) -> torch.Tensor:
     # get the reward
     batch_size = samples[0].betas.shape[0]
     
-    #foot_skate_reward = compute_foot_skate(pred_Ts_world_joint=pred_joints.Ts_world_joint[:, :, :21, :], return_tensor=True)
+    foot_skate_reward = compute_foot_skate_reward(pred_Ts_world_joint=pred_joints.Ts_world_joint[:, :, :21, :], return_tensor=True)
     
     mpjpe_reward = compute_mpjpe_reward(
         label_T_world_root=label_joints.T_world_root,
@@ -80,10 +80,12 @@ def compute_rewards(samples: torch.Tensor, batch, body_model) -> torch.Tensor:
     
     pampjpe_reward = compute_mpjpe_reward(
         label_T_world_root=label_joints.T_world_root,
-        label_Ts_world_joint=label_joints.Ts_world_joint[:, :21, :],
+        label_Ts_world_joint=label_joints.Ts_world_joint[:, :, :21, :],
         pred_T_world_root=pred_joints.T_world_root,
         pred_Ts_world_joint=pred_joints.Ts_world_joint[:, :, :21, :],
         per_frame_procrustes_align=True,
-    ),
+    )
     
-    return mpjpe_reward # foot_skate_reward
+    reward = - (mpjpe_reward + pampjpe_reward)
+    
+    return reward # foot_skate_reward

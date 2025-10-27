@@ -36,7 +36,6 @@ import os
 
 torch.manual_seed(42) 
 
-
 @dataclasses.dataclass(frozen=True)
 class EgoAlloTrainConfig:
     experiment_name: str
@@ -53,7 +52,7 @@ class EgoAlloTrainConfig:
     num_inner_epochs: int = 1
     
     # Dataset arguments.
-    batch_size: int = 32
+    batch_size: int = 64
     """Effective batch size."""
     num_workers: int = 4
     subseq_len: int = 128
@@ -80,8 +79,6 @@ class EgoAlloTrainConfig:
     # visualization related
     vis_interval = 20
     
-
-
 def get_experiment_dir(experiment_name: str, version: int = 0) -> Path:
     """Creates a directory to put experiment files in, suffixed with a version
     number. Similar to PyTorch lightning."""
@@ -166,11 +163,14 @@ def run_training(
         collate_fn=collate_dataclass,
         drop_last=True,
     )
+    
     optim = torch.optim.AdamW(  # type: ignore
         model.parameters(),
         lr=config.learning_rate,
         weight_decay=config.weight_decay,
     )
+    model.latent_from_cond.requires_grad_(False)  # Freeze conditional encoder.
+    
     # scheduler = torch.optim.lr_scheduler.LambdaLR(
     #     optim, lr_lambda=lambda step: min(1.0, step / config.warmup_steps)
     # )
@@ -229,8 +229,6 @@ def run_training(
                     model,
                     body_model=body_model,
                     guidance_mode="no_hands",
-                    guidance_inner=False,
-                    guidance_post=False,
                     Ts_world_cpf=current_batch.T_world_cpf,
                     hamer_detections=None,
                     aria_detections=None,
@@ -242,24 +240,25 @@ def run_training(
                 )
                 
                 rewards = compute_rewards(samples, current_batch, body_model)
-                log_probs = torch.stack(logprobs, dim=1).detach() # (4, num_steps, ...)
+                log_probs = torch.stack(logprobs, dim=1) # (4, num_steps, ...)
+                samples_packed = torch.stack(samples_packed, dim =1) # (4, num_steps+1, ...)
                 
-                all_samples.append(torch.cat(samples_packed, dim = 1))
+                #all_samples.append(torch.cat(samples_packed, dim = 1))
+                all_samples.append(samples_packed)
                 all_log_probs.append(log_probs)
                 all_rewards.append(rewards)
                 
                 torch.cuda.empty_cache()
                 
-            all_samples = torch.cat(all_samples, dim=0).detach()
-            all_log_probs = torch.cat(all_log_probs, dim=0).detach()
+            all_samples = torch.cat(all_samples, dim=0)
+            all_log_probs = torch.cat(all_log_probs, dim=0)
             all_rewards = torch.cat(all_rewards, dim=0).to(torch.float32)
-            all_rewards = -all_rewards 
+            
             timesteps = quadratic_ts(return_tensor=True, set_final_step=True).to(device=device).repeat(config.batch_size * config.group_size, 1) 
             conditions = train_batch.T_world_cpf.to(device)
             
             if epoch % config.save_vis_freq == 0:
                 vis_meshes(all_samples, conditions, body_model, config.vis_interval, save_path = f'{experiment_dir}/visualization/{epoch}.obj')
-            
             
             samples_dict={
                 "conditions": conditions, # [batch, seq_len, 7]
@@ -285,7 +284,7 @@ def run_training(
             samples_dict["advantages"] = advantages
             samples_dict["final_advantages"] = advantages
             
-            total_batch_size, num_timesteps = samples_dict["timesteps"].shape #256, 32
+            total_batch_size, num_timesteps = samples_dict["timesteps"].shape #256, 29
             
             # model training loop
             model.train()
@@ -344,7 +343,7 @@ def run_training(
                             accelerator.clip_grad_norm_(model.parameters(), config.max_grad_norm)
                         optim.step()
                         #scheduler.step()
-                        optim.zero_grad(set_to_none=True)
+                        optim.zero_grad()
                         
                 # Print status update to terminal.
                 mem_free, mem_total = torch.cuda.mem_get_info()
@@ -354,7 +353,7 @@ def run_training(
                     #f" lr: {scheduler.get_last_lr()[0]:.7f}"
                     f" loss: {loss.item():.6f}"
                     f" reward: {all_rewards.mean().item():.6f}"
-                )
+                )    
 
             # Checkpointing.
             if epoch % config.save_ckpt_freq == 0:

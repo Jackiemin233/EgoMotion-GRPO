@@ -387,7 +387,7 @@ class TrainingLossComputer:
         
         # log prob of prev_sample given prev_sample_mean and Sigma_t
         log_prob = (
-            -((x_t_packed.detach() - x_t_packed_wonoise) ** 2) / (2 * (sigma_t[t] **2))[:, None, None]
+            -((x_t_packed - x_t_packed_wonoise) ** 2) / (2 * (sigma_t[t] **2))[:, None, None]
             - torch.log(sigma_t[t])[:, None, None]
             - torch.log(torch.sqrt(2 * torch.as_tensor(math.pi)))
         )
