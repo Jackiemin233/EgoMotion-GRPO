@@ -20,20 +20,23 @@ from egoallo import network, training_loss, training_utils
 from egoallo.data.amass import EgoAmassHdf5Dataset
 from egoallo.data.dataclass import collate_dataclass
 
+from egoallo.inference_utils import load_denoiser
+
 
 @dataclasses.dataclass(frozen=True)
 class EgoAlloTrainConfig:
     experiment_name: str
     dataset_hdf5_path: Path
     dataset_files_path: Path
-
+    checkpoint_dir: Path =  Path("./egoallo_checkpoint_april13/checkpoints_3000000/")
+    
     model: network.EgoDenoiserConfig = network.EgoDenoiserConfig()
     loss: training_loss.TrainingLossConfig = training_loss.TrainingLossConfig()
 
     # Dataset arguments.
     batch_size: int = 256
     """Effective batch size."""
-    num_workers: int = 2
+    num_workers: int = 4
     subseq_len: int = 128
     dataset_slice_strategy: Literal[
         "deterministic", "random_uniform_len", "random_variable_len"
@@ -112,7 +115,13 @@ def run_training(
         logger.add(experiment_dir / "trainlog.log", rotation="100 MB")
 
     # Setup.
-    model = network.EgoDenoiser(config.model)
+    if config.checkpoint_dir is None:
+        model = network.EgoDenoiser(config.model)
+    else:
+        model = load_denoiser(config.checkpoint_dir, config.model).to(device)
+        logger.info("Loaded pretrained model from {}".format(config.checkpoint_dir))
+    
+    
     train_loader = torch.utils.data.DataLoader(
         dataset=EgoAmassHdf5Dataset(
             config.dataset_hdf5_path,

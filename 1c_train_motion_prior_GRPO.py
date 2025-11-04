@@ -1,5 +1,15 @@
 """Training script for EgoAllo diffusion model using HuggingFace accelerate."""
 
+"""
+CUDA_VISIBLE_DEVICES=1 python --config.experiment-name debug_reward --config.dataset-hdf5-path ./data/egoalgo_no_skating_dataset.hdf5 --config.dataset-files-path ./data/egoalgo_no_skating_dataset_files.txt
+
+CUDA_VISIBLE_DEVICES=4,5,6,7 1c_train_motion_prior_GRPO.py accelerate launch  --config.experiment-name debug_reward --config.dataset-hdf5-path ./data/egoalgo_no_skating_dataset.hdf5 --config.dataset-files-path ./data/egoalgo_no_skating_dataset_files.txt
+
+CUDA_VISIBLE_DEVICES=4 1c_train_motion_prior_GRPO.py accelerate launch  --config.experiment-name ours --config.dataset-hdf5-path ./data/egoalgo_no_skating_dataset.hdf5 --config.dataset-files-path ./data/egoalgo_no_skating_dataset_files.txt
+
+CUDA_VISIBLE_DEVICES=4 python 1c_train_motion_prior_GRPO.py --config.experiment-name ours --config.dataset-hdf5-path ./data/egoalgo_no_skating_dataset.hdf5 --config.dataset-files-path ./data/egoalgo_no_skating_dataset_files.txt
+"""
+
 
 
 import dataclasses
@@ -33,6 +43,9 @@ from egoallo.vis_helpers import vis_meshes
 from tqdm import tqdm
 import os
 
+# for reward model
+from thirdparty.MotionCritic.MotionCritic.lib.model.load_critic import load_critic
+
 
 torch.manual_seed(42) 
 
@@ -41,15 +54,16 @@ class EgoAlloTrainConfig:
     experiment_name: str
     dataset_hdf5_path: Path
     dataset_files_path: Path
-    checkpoint_dir: Path =  Path("./egoallo_checkpoint_april13/checkpoints_3000000/")
+    checkpoint_dir: Path = Path("./egoallo_checkpoint_april13/checkpoints_3000000/")
     smplh_npz_path: Path = Path("./data/smplh/neutral/model.npz")
 
     model: network.EgoDenoiserConfig = network.EgoDenoiserConfig()
     loss: training_loss.TrainingLossConfig = training_loss.TrainingLossConfig()
     
     # GRPO Group Size
-    group_size: int = 8
+    group_size: int = 16
     num_inner_epochs: int = 1
+    eta : float = 0.9
     
     # Dataset arguments.
     batch_size: int = 64
@@ -67,12 +81,16 @@ class EgoAlloTrainConfig:
     )
 
     # Optimizer options.
-    learning_rate: float = 1e-5
+    learning_rate: float = 1e-3
     weight_decay: float = 1e-4
     warmup_steps: int = 1000
     max_grad_norm: float = 1.0
     
-    # training related
+    # Reward model
+    enable_reward_model: bool = True
+    reward_model_path: str = "./data/motioncritic_pre.pth"
+    
+    # training related 
     save_ckpt_freq = 100
     save_vis_freq = 5
     
@@ -142,7 +160,7 @@ def run_training(
 
     # Setup.
     model = load_denoiser(config.checkpoint_dir).to(device)
-    #model = network.EgoDenoiser(config.model)
+    logger.info("Loaded pretrained model from {}".format(config.checkpoint_dir))
     body_model = fncsmpl.SmplhModel.load(config.smplh_npz_path).to(device)
     
     train_loader = torch.utils.data.DataLoader(
@@ -156,7 +174,7 @@ def run_training(
             random_variable_len_proportion=config.dataset_slice_random_variable_len_proportion,
         ),
         batch_size=config.batch_size,
-        shuffle = False, # TODO: Should be true for training
+        shuffle = True, # TODO: Should be true for training
         num_workers=config.num_workers,
         persistent_workers=config.num_workers > 0,
         pin_memory=True,
@@ -169,7 +187,17 @@ def run_training(
         lr=config.learning_rate,
         weight_decay=config.weight_decay,
     )
-    model.latent_from_cond.requires_grad_(False)  # Freeze conditional encoder.
+    #model.latent_from_cond.requires_grad_(False)  # Freeze conditional encoder.
+    
+    # import reward model
+    if config.enable_reward_model and config.reward_model_path is not None:
+        reward_model = load_critic("./data/motioncritic_pre.pth", device)
+        reward_model.eval()
+        reward_model.requires_grad_(False)
+        logger.info("Loaded reward model from {}".format(config.reward_model_path))
+    else:
+        reward_model = None
+        logger.info("No reward model loaded.")
     
     # scheduler = torch.optim.lr_scheduler.LambdaLR(
     #     optim, lr_lambda=lambda step: min(1.0, step / config.warmup_steps)
@@ -179,6 +207,8 @@ def run_training(
     model, train_loader, optim = accelerator.prepare(
         model, train_loader, optim
     )
+    if reward_model is not None:
+        reward_model = accelerator.prepare(reward_model)
         
     # model, train_loader, optim, scheduler = accelerator.prepare(
     #     model, train_loader, optim, scheduler
@@ -212,6 +242,7 @@ def run_training(
         for epoch, train_batch in enumerate(train_loader):
             # Sampling Stage
             # Repeat n times for GRPO
+            model.eval()
             batch_size = config.batch_size
             
             train_batch = train_batch.expand_sequence(config.group_size)
@@ -237,11 +268,12 @@ def run_training(
                     device=device,
                     guidance_verbose=False,
                     return_packed=True,
+                    eta = config.eta
                 )
                 
-                rewards = compute_rewards(samples, current_batch, body_model)
+                rewards, reward_dict = compute_rewards(samples, current_batch, body_model, reward_model)
                 log_probs = torch.stack(logprobs, dim=1) # (4, num_steps, ...)
-                samples_packed = torch.stack(samples_packed, dim =1) # (4, num_steps+1, ...)
+                samples_packed = torch.stack(samples_packed, dim = 1) # (4, num_steps+1, ...)
                 
                 #all_samples.append(torch.cat(samples_packed, dim = 1))
                 all_samples.append(samples_packed)

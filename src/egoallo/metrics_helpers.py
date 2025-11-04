@@ -8,6 +8,37 @@ from typing_extensions import assert_never
 
 from .transforms import SO3
 
+################################## Constant of Joint details ##################################
+JOINT_NAMES = [
+    "Hips",
+    "LeftUpLeg",
+    "RightUpLeg",
+    "Spine",
+    "LeftLeg",
+    "RightLeg",
+    "Spine1",
+    "LeftFoot",
+    "RightFoot",
+    "Spine2",
+    "LeftToe",
+    "RightToe",
+    "Neck",
+    "LeftShoulder",
+    "RightShoulder",
+    "Head",
+    "LeftArm",
+    "RightArm",
+    "LeftForeArm",
+    "RightForeArm",
+    "LeftHand",
+    "RightHand"
+]
+
+upper_index = [3, 6, 9, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21]
+lower_index = [0, 1, 2, 4, 5, 7, 8]
+hand_index = [20, 21]
+foot_index = [7, 8]
+################################## Constant of Joint details ##################################
 
 def compute_foot_skate(
     pred_Ts_world_joint: Float[Tensor, "num_samples time 21 7"],
@@ -85,6 +116,85 @@ def compute_foot_contact(
 
     return any_contact.numpy(force=True)
 
+def compute_foot_contact_reward(
+    pred_Ts_world_joint: Float[Tensor, "num_samples time 21 7"],
+    return_tensor: bool = True,
+) -> np.ndarray:
+    (num_samples, time) = pred_Ts_world_joint.shape[:2]
+
+    foot_indices = torch.tensor([6, 7, 9, 10], device=pred_Ts_world_joint.device)
+
+    # From EgoEgo / kinpoly.
+    H_thresh = torch.tensor(
+        # To match indices above: (ankle, ankle, toe, toe)
+        [0.08, 0.08, 0.04, 0.04],
+        device=pred_Ts_world_joint.device,
+        dtype=torch.float32,
+    )
+
+    foot_positions = pred_Ts_world_joint[:, :, foot_indices, 4:7]
+
+    any_contact = torch.any(
+        torch.any(foot_positions[..., 2] < H_thresh, dim=-1), dim=-1
+    ).to(torch.float32)
+    assert any_contact.shape == (num_samples,)
+
+    if return_tensor:
+        return any_contact
+    else: 
+        return any_contact.numpy(force=True)
+
+def compute_foot_skate_reward(
+    pred_Ts_world_joint: Float[Tensor, "num_samples time 21 7"],
+    return_tensor: bool = False,
+) -> np.ndarray:
+    (num_samples, time) = pred_Ts_world_joint.shape[:2]
+
+    # Drop the person to the floor.
+    # This is necessary for the foot skating metric to make sense for floating people...!
+    pred_Ts_world_joint = pred_Ts_world_joint.clone()
+    for i in range(num_samples):
+        pred_Ts_world_joint[i, ..., 6] -= torch.min(pred_Ts_world_joint[i, ..., 6])
+
+    foot_indices = torch.tensor([6, 7, 9, 10], device=pred_Ts_world_joint.device)
+
+    foot_positions = pred_Ts_world_joint[:, :, foot_indices, 4:7]
+    foot_positions_diff = foot_positions[:, 1:, :, :2] - foot_positions[:, :-1, :, :2]
+    assert foot_positions_diff.shape == (num_samples, time - 1, 4, 2)
+
+    foot_positions_diff_norm = torch.sum(torch.abs(foot_positions_diff), dim=-1)
+    assert foot_positions_diff_norm.shape == (num_samples, time - 1, 4)
+
+    # From EgoEgo / kinpoly.
+    H_thresh = torch.tensor(
+        # To match indices above: (ankle, ankle, toe, toe)
+        [0.08, 0.08, 0.04, 0.04],
+        device=pred_Ts_world_joint.device,
+        dtype=torch.float32,
+    )
+
+    foot_positions_diff_norm = torch.sum(torch.abs(foot_positions_diff), dim=-1)
+    assert foot_positions_diff_norm.shape == (num_samples, time - 1, 4)
+
+    # Threshold.
+    foot_positions_diff_norm = foot_positions_diff_norm * (
+        foot_positions[..., 1:, :, 2] < H_thresh
+    ).to(torch.float32)
+    fs_per_sample = torch.sum(
+        torch.sum(
+            foot_positions_diff_norm
+            * (2 - 2 ** (foot_positions[..., 1:, :, 2] / H_thresh)),
+            dim=-1,
+        ),
+        dim=-1,
+    )
+    assert fs_per_sample.shape == (num_samples,)
+
+    if return_tensor:
+        return fs_per_sample
+    else: 
+        return fs_per_sample.numpy(force=True)
+
 
 def compute_head_ori(
     label_Ts_world_joint: Float[Tensor, "time 21 7"],
@@ -122,6 +232,7 @@ def compute_mpjpe_reward(
     pred_T_world_root: Float[Tensor, "batch time 7"],
     pred_Ts_world_joint: Float[Tensor, "batch time 21 7"],
     per_frame_procrustes_align: bool,
+    metric_coefficient: float = 1000.0
 ) -> np.ndarray:
     num_samples, time, _, _ = pred_Ts_world_joint.shape
 
@@ -148,7 +259,7 @@ def compute_mpjpe_reward(
     assert position_differences.shape == (num_samples, time, 22, 3)
 
     # Per-joint position errors, in millimeters.
-    pjpe = torch.linalg.norm(position_differences, dim=-1) * 1000.0
+    pjpe = torch.linalg.norm(position_differences, dim=-1) * metric_coefficient
     assert pjpe.shape == (num_samples, time, 22)
 
     # Mean per-joint position errors.
@@ -156,6 +267,187 @@ def compute_mpjpe_reward(
     assert mpjpe.shape == (num_samples,)
 
     return mpjpe
+
+def jitter_reward(
+    label_T_world_root: Float[Tensor, "time 7"],
+    label_Ts_world_joint: Float[Tensor, "time 21 7"],
+    pred_T_world_root: Float[Tensor, "num_samples time 7"],
+    pred_Ts_world_joint: Float[Tensor, "num_samples time 21 7"],
+    fps: int = 30
+):
+    num_samples, time, _, _ = pred_Ts_world_joint.shape
+    # Concatenate the world root to the joints.
+    label_Ts_world_joint = torch.cat(
+        [label_T_world_root[..., None, :], label_Ts_world_joint], dim=-2
+    )
+    pred_Ts_world_joint = torch.cat(
+        [pred_T_world_root[..., None, :], pred_Ts_world_joint], dim=-2
+    )
+    del label_T_world_root, pred_T_world_root
+    
+    pred_joint_positions = pred_Ts_world_joint[:, :, :, 4:7]
+    label_joint_positions = label_Ts_world_joint[:, :, :, 4:7]
+
+    pred_jitter = (
+        (
+            (
+                pred_joint_positions[:, 3:]
+                - 3 * pred_joint_positions[:, 2:-1]
+                + 3 * pred_joint_positions[:, 1:-2]
+                - pred_joint_positions[:, :-3]
+            )
+            * (fps**3)
+        )
+        .norm(dim=3)
+        .mean()
+    )
+    
+    gt_jitter = (
+        torch.mean(
+        (
+            (
+                label_joint_positions[:, 3:]
+                - 3 * label_joint_positions[:, 2:-1]
+                + 3 * label_joint_positions[:, 1:-2]
+                - label_joint_positions[:, :-3]
+            )
+            * (fps**3)
+        )
+        .norm(dim=3)
+        , dim = (-1,-2))
+    )
+    jitter = pred_jitter / gt_jitter
+    
+    return jitter
+
+
+def jitter(
+    label_T_world_root: Float[Tensor, "time 7"],
+    label_Ts_world_joint: Float[Tensor, "time 21 7"],
+    pred_T_world_root: Float[Tensor, "num_samples time 7"],
+    pred_Ts_world_joint: Float[Tensor, "num_samples time 21 7"],
+    fps: int = 30
+):
+    num_samples, time, _, _ = pred_Ts_world_joint.shape
+    # Concatenate the world root to the joints.
+    label_Ts_world_joint = torch.cat(
+        [label_T_world_root[..., None, :], label_Ts_world_joint], dim=-2
+    )
+    pred_Ts_world_joint = torch.cat(
+        [pred_T_world_root[..., None, :], pred_Ts_world_joint], dim=-2
+    )
+    del label_T_world_root, pred_T_world_root
+    
+    pred_joint_positions = pred_Ts_world_joint[:, :, :, 4:7]
+    label_joint_positions = label_Ts_world_joint[None, :, :, 4:7].repeat(
+        num_samples, 1, 1, 1
+    )
+
+    pred_jitter = (
+        (
+            (
+                pred_joint_positions[:, 3:]
+                - 3 * pred_joint_positions[:, 2:-1]
+                + 3 * pred_joint_positions[:, 1:-2]
+                - pred_joint_positions[:, :-3]
+            )
+            * (fps**3)
+        )
+        .norm(dim=3)
+        .mean()
+    )
+    
+    gt_jitter = (
+        (
+            (
+                label_joint_positions[:, 3:]
+                - 3 * label_joint_positions[:, 2:-1]
+                + 3 * label_joint_positions[:, 1:-2]
+                - label_joint_positions[:, :-3]
+            )
+            * (fps**3)
+        )
+        .norm(dim=3)
+        .mean()
+    )
+    jitter = np.array(pred_jitter.detach().cpu()) / np.array(gt_jitter.detach().cpu())
+    
+    return jitter
+
+def compute_mpjre(
+    label_T_world_root: Float[Tensor, "time 7"],
+    label_Ts_world_joint: Float[Tensor, "time 21 7"],
+    pred_T_world_root: Float[Tensor, "num_samples time 7"],
+    pred_Ts_world_joint: Float[Tensor, "num_samples time 21 7"],
+)-> np.ndarray:
+    diff = gt_angle - predicted_angle
+    diff[diff > np.pi] = diff[diff > np.pi] - 2 * np.pi
+    diff[diff < -np.pi] = diff[diff < -np.pi] + 2 * np.pi
+    rot_error = torch.mean(torch.absolute(diff))
+    return rot_error
+    
+
+def compute_mpjve(
+    label_T_world_root: Float[Tensor, "time 7"],
+    label_Ts_world_joint: Float[Tensor, "time 21 7"],
+    pred_T_world_root: Float[Tensor, "num_samples time 7"],
+    pred_Ts_world_joint: Float[Tensor, "num_samples time 21 7"],
+    fps: int = 30
+) -> np.ndarray:
+    num_samples, time, _, _ = pred_Ts_world_joint.shape
+
+    # Concatenate the world root to the joints.
+    label_Ts_world_joint = torch.cat(
+        [label_T_world_root[..., None, :], label_Ts_world_joint], dim=-2
+    )
+    pred_Ts_world_joint = torch.cat(
+        [pred_T_world_root[..., None, :], pred_Ts_world_joint], dim=-2
+    )
+    del label_T_world_root, pred_T_world_root
+
+    pred_joint_positions = pred_Ts_world_joint[:, :, :, 4:7]
+    label_joint_positions = label_Ts_world_joint[None, :, :, 4:7].repeat(
+        num_samples, 1, 1, 1
+    )
+    
+    #joint_idx = upper_index + lower_index
+    label_velocity = (label_joint_positions[:, 1:, ...] - label_joint_positions[:, :-1, ...]) * fps
+    pred_velocity = (pred_joint_positions[:, 1:, ...] - pred_joint_positions[:, :-1, ...]) * fps
+    
+    ve = torch.mean(
+        torch.sqrt(torch.sum(torch.square(label_velocity[:,:,:] - pred_velocity[:,:,:]), axis=-1))
+    )
+    return ve.cpu().numpy()
+
+def compute_mpjve_reward(
+    label_T_world_root: Float[Tensor, "time 7"],
+    label_Ts_world_joint: Float[Tensor, "time 21 7"],
+    pred_T_world_root: Float[Tensor, "num_samples time 7"],
+    pred_Ts_world_joint: Float[Tensor, "num_samples time 21 7"],
+    metric_coefficient: float = 1000.0,
+    fps: int = 30
+) -> np.ndarray:
+
+    # Concatenate the world root to the joints.
+    label_Ts_world_joint = torch.cat(
+        [label_T_world_root[..., None, :], label_Ts_world_joint], dim=-2
+    )
+    pred_Ts_world_joint = torch.cat(
+        [pred_T_world_root[..., None, :], pred_Ts_world_joint], dim=-2
+    )
+    del label_T_world_root, pred_T_world_root
+
+    pred_joint_positions = pred_Ts_world_joint[:, :, :, 4:7]
+    label_joint_positions = label_Ts_world_joint[:, :, :, 4:7]
+    
+    label_velocity = (label_joint_positions[:, 1:, ...] - label_joint_positions[:, :-1, ...]) * fps
+    pred_velocity = (pred_joint_positions[:, 1:, ...] - pred_joint_positions[:, :-1, ...]) * fps
+    
+    ve = torch.mean(
+        torch.sqrt(torch.sum(torch.square(label_velocity - pred_velocity), axis=-1)), dim = (-1,-2)
+    ) * metric_coefficient
+    
+    return ve
 
 
 def compute_mpjpe(
@@ -201,6 +493,102 @@ def compute_mpjpe(
 
     return mpjpe.cpu().numpy()
 
+def compute_groundpenetrate_reward(
+    label_T_world_root: Float[Tensor, "time 7"],
+    label_Ts_world_joint: Float[Tensor, "time 21 7"],
+    pred_T_world_root: Float[Tensor, "num_samples time 7"],
+    pred_Ts_world_joint: Float[Tensor, "num_samples time 21 7"],
+    ground_height = 0.0,
+    metric_coefficient = 1000.0
+) -> np.ndarray:
+    num_samples, time, _, _ = pred_Ts_world_joint.shape
+
+    # Concatenate the world root to the joints.
+    label_Ts_world_joint = torch.cat(
+        [label_T_world_root[..., None, :], label_Ts_world_joint], dim=-2
+    )
+    pred_Ts_world_joint = torch.cat(
+        [pred_T_world_root[..., None, :], pred_Ts_world_joint], dim=-2
+    )
+    del label_T_world_root, pred_T_world_root
+
+    pred_joint_positions = pred_Ts_world_joint[:, :, :, 4:7]
+
+    pred_joint_positions_height = pred_joint_positions[:, :, :, 2]
+    
+    penetration_depth = torch.clamp(-pred_joint_positions_height, min=ground_height)
+    assert penetration_depth.shape == (num_samples, time, 22)
+
+    gp_per_sample = torch.sum(penetration_depth, dim=(-1, -2)) * metric_coefficient
+    assert gp_per_sample.shape == (num_samples,)
+
+    return gp_per_sample
+
+def compute_groundpenetrate(
+    label_T_world_root: Float[Tensor, "time 7"],
+    label_Ts_world_joint: Float[Tensor, "time 21 7"],
+    pred_T_world_root: Float[Tensor, "num_samples time 7"],
+    pred_Ts_world_joint: Float[Tensor, "num_samples time 21 7"],
+    ground_height = 0.0,
+) -> np.ndarray:
+    num_samples, time, _, _ = pred_Ts_world_joint.shape
+
+    # Concatenate the world root to the joints.
+    label_Ts_world_joint = torch.cat(
+        [label_T_world_root[..., None, :], label_Ts_world_joint], dim=-2
+    )
+    pred_Ts_world_joint = torch.cat(
+        [pred_T_world_root[..., None, :], pred_Ts_world_joint], dim=-2
+    )
+    del label_T_world_root, pred_T_world_root
+
+    pred_joint_positions = pred_Ts_world_joint[:, :, :, 4:7]
+    label_joint_positions = label_Ts_world_joint[None, :, :, 4:7].repeat(
+        num_samples, 1, 1, 1
+    )
+
+    pred_joint_positions_height = pred_joint_positions[:, :, :, 2]
+    
+    penetration_depth = torch.clamp(-pred_joint_positions_height, min=ground_height)
+    assert penetration_depth.shape == (num_samples, time, 22)
+
+    gp_per_sample = torch.sum(penetration_depth, dim=(-1, -2))
+    assert gp_per_sample.shape == (num_samples,)
+
+    return gp_per_sample.cpu().numpy()
+
+def compute_footclipping(
+    label_T_world_root: Float[Tensor, "time 7"],
+    label_Ts_world_joint: Float[Tensor, "time 21 7"],
+    pred_T_world_root: Float[Tensor, "num_samples time 7"],
+    pred_Ts_world_joint: Float[Tensor, "num_samples time 21 7"],
+    clip_threshold: float = 0.05
+) -> np.ndarray:
+    num_samples, time, _, _ = pred_Ts_world_joint.shape
+
+    # Concatenate the world root to the joints.
+    label_Ts_world_joint = torch.cat(
+        [label_T_world_root[..., None, :], label_Ts_world_joint], dim=-2
+    )
+    pred_Ts_world_joint = torch.cat(
+        [pred_T_world_root[..., None, :], pred_Ts_world_joint], dim=-2
+    )
+    del label_T_world_root, pred_T_world_root
+
+    pred_joint_positions = pred_Ts_world_joint[:, :, :, 4:7]
+    
+    left_foot_positions = pred_joint_positions[:, :, 7]
+    right_foot_positions = pred_joint_positions[:, :, 8]
+    
+    foot_distance = torch.linalg.norm(right_foot_positions - left_foot_positions, dim=-1)
+    
+    mask = foot_distance < clip_threshold
+    
+    foot_distance = foot_distance * mask.to(torch.float32)
+    
+    foot_clipping = torch.sum(foot_distance)
+    
+    return foot_clipping.cpu().numpy()
 
 @overload
 def procrustes_align(

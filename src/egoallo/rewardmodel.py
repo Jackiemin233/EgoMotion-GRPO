@@ -8,11 +8,14 @@ from egoallo.fncsmpl_extensions import get_T_world_root_from_cpf_pose
 from egoallo.transforms import SE3, SO3
 
 from egoallo.metrics_helpers import (
-    compute_foot_contact,
-    compute_foot_skate,
-    compute_head_trans,
+    compute_foot_contact_reward,
+    compute_foot_skate_reward,
     compute_mpjpe_reward,
+    compute_groundpenetrate_reward,
+    compute_mpjve_reward,
+    jitter_reward
 )
+
 
 device = torch.device("cuda")
 
@@ -22,9 +25,37 @@ class RewardModel(nn.Module):
         
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.model(x).squeeze(-1)
+
+
+def quaternion_to_axis_angle(quaternions):
+    """
+    Convert rotations given as quaternions to axis/angle.
+    Args:
+        quaternions: quaternions with real part first,
+            as tensor of shape (..., 4).
+    Returns:
+        Rotations given as a vector in axis angle form, as a tensor
+            of shape (..., 3), where the magnitude is the angle
+            turned anticlockwise in radians around the vector's
+            direction.
+    """
+    norms = torch.norm(quaternions[..., 1:], p=2, dim=-1, keepdim=True)
+    half_angles = torch.atan2(norms, quaternions[..., :1])
+    angles = 2 * half_angles
+    eps = 1e-6
+    small_angles = angles.abs() < eps
+    sin_half_angles_over_angles = torch.empty_like(angles)
+    sin_half_angles_over_angles[~small_angles] = (
+        torch.sin(half_angles[~small_angles]) / angles[~small_angles]
+    )
+    # for x small, sin(x/2) is about x/2 - (x/2)^3/6
+    # so sin(x/2)/x is about 1/2 - (x*x)/48
+    sin_half_angles_over_angles[small_angles] = (
+        0.5 - (angles[small_angles] * angles[small_angles]) / 48
+    )
+    return quaternions[..., 1:] / sin_half_angles_over_angles
     
-
-
+    
 def get_joints(samples, batch, body_model):
     
     # pred result
@@ -49,12 +80,11 @@ def get_joints(samples, batch, body_model):
             dim=2,
         ),
     )
-
     return pred_posed, label_posed
 
 
 
-def compute_rewards(samples: torch.Tensor, batch, body_model) -> torch.Tensor:
+def compute_rewards(samples, batch, body_model, reward_model = None) -> torch.Tensor:
     """ Compute rewards for the given samples and batch data.
 
     Args:
@@ -76,6 +106,7 @@ def compute_rewards(samples: torch.Tensor, batch, body_model) -> torch.Tensor:
         pred_T_world_root=pred_joints.T_world_root,
         pred_Ts_world_joint=pred_joints.Ts_world_joint[:, :, :21, :],
         per_frame_procrustes_align=False,
+        metric_coefficient = 1000.0
     )
     
     pampjpe_reward = compute_mpjpe_reward(
@@ -84,8 +115,73 @@ def compute_rewards(samples: torch.Tensor, batch, body_model) -> torch.Tensor:
         pred_T_world_root=pred_joints.T_world_root,
         pred_Ts_world_joint=pred_joints.Ts_world_joint[:, :, :21, :],
         per_frame_procrustes_align=True,
+        metric_coefficient = 1000.0
+    )
+        
+    mpjve_reward = compute_mpjve_reward(
+        label_T_world_root=label_joints.T_world_root,
+        label_Ts_world_joint=label_joints.Ts_world_joint[:, :, :21, :],
+        pred_T_world_root=pred_joints.T_world_root,
+        pred_Ts_world_joint=pred_joints.Ts_world_joint[:, :, :21, :],
+        metric_coefficient = 1000.0
     )
     
-    reward = - (mpjpe_reward + pampjpe_reward)
+    gp_reward = compute_groundpenetrate_reward(
+        label_T_world_root=label_joints.T_world_root,
+        label_Ts_world_joint=label_joints.Ts_world_joint[:, :, :21, :],
+        pred_T_world_root=pred_joints.T_world_root,
+        pred_Ts_world_joint=pred_joints.Ts_world_joint[:, :, :21, :],
+        metric_coefficient = 1000.0
+    )
     
-    return reward # foot_skate_reward
+    #foot_contact_reward = compute_foot_contact_reward(pred_Ts_world_joint=pred_joints.Ts_world_joint[:, :, :21, :], return_tensor=True)
+    
+    # pred_jitter = jitter_reward(
+    #     label_T_world_root=label_joints.T_world_root,
+    #     label_Ts_world_joint=label_joints.Ts_world_joint[:, :, :21, :],
+    #     pred_T_world_root=pred_joints.T_world_root,
+    #     pred_Ts_world_joint=pred_joints.Ts_world_joint[:, :, :21, :],
+    # )
+
+    if reward_model is not None:
+        # prepare input for reward model
+        # Convert 7D rotation to 6D rotation representation
+        pred_joints_root_quaternion = pred_joints.T_world_root[:, :, None, :4]
+        pred_joints_body_quaternion = pred_joints.Ts_world_joint[:, :, :21, :4]
+        pred_joints_lhand_quaternion = pred_joints.Ts_world_joint[:, :, [25], :4]
+        pred_joints_rhand_quaternion = pred_joints.Ts_world_joint[:, :, [40], :4]
+        pred_joints_quaternion = torch.cat([
+            pred_joints_root_quaternion,
+            pred_joints_body_quaternion,
+            pred_joints_lhand_quaternion,
+            pred_joints_rhand_quaternion
+        ], dim = 2)
+        
+        pred_joints_axis_angle = quaternion_to_axis_angle(pred_joints_quaternion)
+        root_xyz = pred_joints.T_world_root[:, :, None, 4:]
+        critic_input = torch.cat([pred_joints_axis_angle, root_xyz], dim=-2)
+        critic_score = reward_model.module.batch_critic(critic_input).reshape(-1)
+        reward_dict = {
+            "foot_skate_reward": foot_skate_reward,
+            "mpjpe_reward": mpjpe_reward,
+            "pampjpe_reward": pampjpe_reward,
+            #"pred_jitter": pred_jitter,
+            "gp_reward": gp_reward,
+            "mpjve_reward": mpjve_reward,
+            #"foot_contact_reward": foot_contact_reward,
+            "critic_score": critic_score
+        } 
+        reward = - (foot_skate_reward + mpjpe_reward + pampjpe_reward + gp_reward + mpjve_reward) + critic_score * 10 #+ foot_contact_reward 
+    else:
+        reward_dict = {
+            "foot_skate_reward": foot_skate_reward,
+            "mpjpe_reward": mpjpe_reward,
+            "pampjpe_reward": pampjpe_reward,
+            #"pred_jitter": pred_jitter,
+            "gp_reward": gp_reward,
+            "mpjve_reward": mpjve_reward,
+            #"foot_contact_reward": foot_contact_reward
+        } 
+        reward = - (foot_skate_reward + mpjpe_reward + pampjpe_reward + gp_reward + mpjve_reward) # + foot_contact_reward 
+    
+    return reward, reward_dict

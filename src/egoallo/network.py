@@ -484,6 +484,7 @@ class EgoDenoiser(nn.Module):
             assert_never(config.positional_encoding)
 
         encoder_out = self.latent_from_cond(cond) + pos_enc
+        #encoder_out = encoder_out.detach()
         decoder_out = x_t_encoded + pos_enc
 
         # Append the noise embedding to the encoder and decoder inputs.

@@ -19,20 +19,36 @@ from .tensor_dataclass import TensorDataclass
 from .transforms import SE3
 
 
-def load_denoiser(checkpoint_dir: Path) -> EgoDenoiser:
-    """Load a denoiser model."""
+def load_denoiser(checkpoint_dir: Path, Config: EgoDenoiserConfig = None) -> EgoDenoiser:
+    """
+        Load a denoiser model.
+        If the input Config is not None, the config will be overwritten.
+    """
     checkpoint_dir = checkpoint_dir.absolute()
     experiment_dir = checkpoint_dir.parent
 
-    config = yaml.load(
-        (experiment_dir / "model_config.yaml").read_text(), Loader=yaml.Loader
-    )
-    assert isinstance(config, EgoDenoiserConfig)
+    if Config is None:
+        config = yaml.load(
+            (experiment_dir / "model_config.yaml").read_text(), Loader=yaml.Loader
+        )
+        assert isinstance(config, EgoDenoiserConfig)
+    else:
+        config = Config
 
     model = EgoDenoiser(config)
     with safe_open(checkpoint_dir / "model.safetensors", framework="pt") as f:  # type: ignore
         state_dict = {k: f.get_tensor(k) for k in f.keys()}
-    model.load_state_dict(state_dict)
+    
+    model_dict = model.state_dict()
+    filtered_state_dict = {}
+    for k, v in state_dict.items():
+        if k in model_dict:
+            if model_dict[k].shape == v.shape:
+                filtered_state_dict[k] = v
+            else:
+                print(f"Skip mismatched dim {k}:  checkpoint dim:{v.shape}, model dim:{model_dict[k].shape}")
+    
+    model.load_state_dict(filtered_state_dict, strict=False)
 
     return model
 

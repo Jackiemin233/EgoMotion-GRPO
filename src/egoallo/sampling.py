@@ -252,6 +252,7 @@ def run_sampling_with_logprob(
     device: torch.device,
     guidance_verbose: bool = True,
     return_packed: bool = False,
+    eta: float = 0.8
 ) -> network.EgoDenoiseTraj:
     batch_size = Ts_world_cpf.shape[0]
     Ts_world_cpf_shifted = Ts_world_cpf.clone()
@@ -353,9 +354,9 @@ def run_sampling_with_logprob(
                 torch.sqrt(
                     (1.0 - alpha_bar_t[:-1]) / (1 - alpha_bar_t[1:]) * (1 - alpha_t)
                 )
-                * 0.8, # (hyperparameter: eta)
+                * eta, 
             ]
-        )
+        )# (hyperparameter: eta)
             
         # See formula (12) from https://arxiv.org/pdf/2010.02502.pdf
         # DDIM process || x_t_packed is the x_{t-1} || prediction_type = sample

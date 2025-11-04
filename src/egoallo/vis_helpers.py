@@ -622,7 +622,41 @@ def vis_meshes(samples, T_world_cpf, body_model, vis_interval = 5,  batch_index 
     motion.triangles = o3d.utility.Vector3iVector(pred_mesh_faces)
     
     o3d.io.write_triangle_mesh(save_path, motion, write_vertex_colors=True)
+    
+def vis_meshes_eval(pred_posed, label_posed, vis_interval = 10, save_path = None, mode = 'seperate'):
+    
+    pred_mesh = pred_posed.lbs()
+    labeled_mesh = label_posed.lbs()
+    
+    pred_mesh_verts = pred_mesh.verts[0, ::vis_interval].cpu().detach() # [7, 6890, 3]
+    pred_mesh_faces = pred_mesh.faces.cpu().detach() #[48230, 3]
+    pred_mesh_faces = expand_faces_for_batch(pred_mesh_faces, B = pred_mesh_verts.shape[0] , N = pred_mesh_verts.shape[1])
+    
+    labeled_mesh_verts = labeled_mesh.verts[::vis_interval].cpu().detach() # [7, 6890, 3]
+    labeled_mesh_faces = labeled_mesh.faces.cpu().detach() #[48230, 3]
+    labeled_mesh_faces = expand_faces_for_batch(labeled_mesh_faces, B = pred_mesh_verts.shape[0] , N = pred_mesh_verts.shape[1])
+    
+    pred_motion = o3d.geometry.TriangleMesh()
+    pred_motion.vertices = o3d.utility.Vector3dVector(pred_mesh_verts.reshape(-1, 3))
+    pred_motion.triangles = o3d.utility.Vector3iVector(pred_mesh_faces)
+    pred_motion.paint_uniform_color([137/255, 207/255, 240/255])  
+    
+    label_motion = o3d.geometry.TriangleMesh()
+    label_motion.vertices = o3d.utility.Vector3dVector(labeled_mesh_verts.reshape(-1, 3))
+    label_motion.triangles = o3d.utility.Vector3iVector(labeled_mesh_faces)
+    label_motion.paint_uniform_color([255/255, 192/255, 203/255]) 
+    
+    if mode == 'seperate': 
+        combined_mesh = o3d.geometry.TriangleMesh()
+        combined_mesh += pred_motion
+        combined_mesh += label_motion
+    
+        o3d.io.write_triangle_mesh(save_path, combined_mesh, write_vertex_colors=True)
+    else:
+        o3d.io.write_triangle_mesh(save_path+'_pred.obj', pred_motion, write_vertex_colors=True)
+        o3d.io.write_triangle_mesh(save_path+'_label.obj', label_motion, write_vertex_colors=True)
 
+    
 def get_bodymesh_sample(samples, T_world_cpf, body_model):
     
     # pred result

@@ -46,11 +46,18 @@ from egoallo.metrics_helpers import (
     compute_foot_skate,
     compute_head_trans,
     compute_mpjpe,
+    compute_mpjve,
+    jitter,
+    compute_groundpenetrate,
+    compute_footclipping,
 )
 from egoallo.data.dataclass import collate_dataclass
 from egoallo.sampling import run_sampling_with_stitching, run_sampling_with_logprob
 from egoallo.transforms import SE3, SO3
 from egoallo.rewardmodel import get_joints
+
+from egoallo.vis_helpers import vis_meshes_eval
+import os
 
 
 def main(
@@ -58,9 +65,11 @@ def main(
     dataset_files_path: Path,
     subseq_len: int = 128,
     guidance_inner: bool = False,
-    checkpoint_dir: Path = Path('/home/yaonanjie/project10/egoallo/experiments/debug/v20/checkpoints_445'), #Path("./egoallo_checkpoint_april13/checkpoints_3000000/"),
-    smplh_npz_path: Path = Path("./data/smplh/neutral/model.npz"),
+    checkpoint_dir: Path =  Path('/home/yaonanjie/project10/egoallo/experiments/ours/v1/checkpoints_300'), #Path("./egoallo_checkpoint_april13/checkpoints_3000000/"), #
+    smplh_npz_path: Path = Path("./data/smplh/neutral/model.npz"), 
     num_samples: int = 1,
+    save_visualizations: bool = True,
+    save_path: Path | None = None,
 ) -> None:
     """Compute body metrics on the test split of the AMASS dataset."""
     device = torch.device("cuda")
@@ -77,24 +86,11 @@ def main(
         slice_strategy="deterministic",
         random_variable_len_proportion=0.0,
     )
-    data_loader = torch.utils.data.DataLoader(
-        dataset=dataset,
-        batch_size=64,
-        shuffle=True,
-        num_workers=8,
-        persistent_workers=False,
-        pin_memory=True,
-        collate_fn=collate_dataclass,
-        drop_last=True,
-    )
     
     
     body_model = fncsmpl.SmplhModel.load(smplh_npz_path).to(device)
 
     metrics = list[dict[str, np.ndarray]]()
-    
-    # for sequence in data_loader:
-    #     sequence = sequence.to(device)
 
     for i in range(len(dataset)):
         sequence = dataset[i].to(device)
@@ -113,21 +109,6 @@ def main(
             device=device,
             guidance_verbose=False,
         )
-        
-        # samples, _ = run_sampling_with_logprob(
-        #     denoiser_network,
-        #     body_model=body_model,
-        #     guidance_mode="no_hands",
-        #     guidance_inner=guidance_inner,
-        #     guidance_post=True,
-        #     Ts_world_cpf=sequence.T_world_cpf,
-        #     hamer_detections=None,
-        #     aria_detections=None,
-        #     num_samples=1,
-        #     floor_z=0.0,
-        #     device=device,
-        #     guidance_verbose=False,
-        # )
         
         assert samples.hand_rotmats is not None
         assert samples.betas.shape == (num_samples, subseq_len, 16)
@@ -156,6 +137,14 @@ def main(
                 dim=1,
             ),
         )
+        
+        if save_visualizations:
+            if save_path is None:# default save path
+                save_path = str(checkpoint_dir)+f'/eval_visualizations/'
+                os.makedirs(save_path, exist_ok=True)
+            save_name = os.path.join(save_path, f'{str(i).zfill(4)}.obj')
+            vis_meshes_eval(pred_posed, label_posed, vis_interval = 15, save_path = save_name)
+        
 
         metrics.append(
             {
@@ -184,6 +173,30 @@ def main(
                 ),
                 "T_head": compute_head_trans(
                     label_Ts_world_joint=label_posed.Ts_world_joint[:, :21, :],
+                    pred_Ts_world_joint=pred_posed.Ts_world_joint[:, :, :21, :],
+                ),
+                "mpjve": compute_mpjve(
+                    label_T_world_root=label_posed.T_world_root,
+                    label_Ts_world_joint=label_posed.Ts_world_joint[:, :21, :],
+                    pred_T_world_root=pred_posed.T_world_root,
+                    pred_Ts_world_joint=pred_posed.Ts_world_joint[:, :, :21, :],
+                ),
+                "jitter": jitter(
+                    label_T_world_root=label_posed.T_world_root,
+                    label_Ts_world_joint=label_posed.Ts_world_joint[:, :21, :],
+                    pred_T_world_root=pred_posed.T_world_root,
+                    pred_Ts_world_joint=pred_posed.Ts_world_joint[:, :, :21, :],
+                ),
+                "ground_penetration": compute_groundpenetrate(
+                    label_T_world_root=label_posed.T_world_root,
+                    label_Ts_world_joint=label_posed.Ts_world_joint[:, :21, :],
+                    pred_T_world_root=pred_posed.T_world_root,
+                    pred_Ts_world_joint=pred_posed.Ts_world_joint[:, :, :21, :],
+                ),
+                "foot_clipping": compute_footclipping(
+                    label_T_world_root=label_posed.T_world_root,
+                    label_Ts_world_joint=label_posed.Ts_world_joint[:, :21, :],
+                    pred_T_world_root=pred_posed.T_world_root,
                     pred_Ts_world_joint=pred_posed.Ts_world_joint[:, :, :21, :],
                 ),
             }
