@@ -13,6 +13,7 @@ from egoallo.metrics_helpers import (
     compute_mpjpe_reward,
     compute_groundpenetrate_reward,
     compute_mpjve_reward,
+    compute_mpjre_reward,
     jitter_reward
 )
 
@@ -134,6 +135,11 @@ def compute_rewards(samples, batch, body_model, reward_model = None) -> torch.Te
         metric_coefficient = 1000.0
     )
     
+    mpjre_reward = compute_mpjre_reward(
+        pred_local_quats = pred_joints.local_quats[:, :, :21, :],
+        label_local_quats = label_joints.local_quats[:, :, :21 ,:]
+    )
+    
     #foot_contact_reward = compute_foot_contact_reward(pred_Ts_world_joint=pred_joints.Ts_world_joint[:, :, :21, :], return_tensor=True)
     
     # pred_jitter = jitter_reward(
@@ -171,7 +177,7 @@ def compute_rewards(samples, batch, body_model, reward_model = None) -> torch.Te
             #"foot_contact_reward": foot_contact_reward,
             "critic_score": critic_score
         } 
-        reward = - (foot_skate_reward + mpjpe_reward + pampjpe_reward + gp_reward + mpjve_reward) + critic_score * 10 #+ foot_contact_reward 
+        reward = - (foot_skate_reward + mpjpe_reward + pampjpe_reward + gp_reward + mpjve_reward + mpjre_reward) + critic_score * 10 #+ foot_contact_reward 
     else:
         reward_dict = {
             "foot_skate_reward": foot_skate_reward,
@@ -182,6 +188,6 @@ def compute_rewards(samples, batch, body_model, reward_model = None) -> torch.Te
             "mpjve_reward": mpjve_reward,
             #"foot_contact_reward": foot_contact_reward
         } 
-        reward = - (foot_skate_reward + mpjpe_reward + pampjpe_reward + gp_reward + mpjve_reward) # + foot_contact_reward 
+        reward = - (foot_skate_reward + mpjpe_reward + pampjpe_reward + gp_reward + mpjve_reward + mpjre_reward) # + foot_contact_reward 
     
     return reward, reward_dict

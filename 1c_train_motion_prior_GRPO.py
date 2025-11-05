@@ -8,9 +8,9 @@ CUDA_VISIBLE_DEVICES=4,5,6,7 1c_train_motion_prior_GRPO.py accelerate launch  --
 CUDA_VISIBLE_DEVICES=4 1c_train_motion_prior_GRPO.py accelerate launch  --config.experiment-name ours --config.dataset-hdf5-path ./data/egoalgo_no_skating_dataset.hdf5 --config.dataset-files-path ./data/egoalgo_no_skating_dataset_files.txt
 
 CUDA_VISIBLE_DEVICES=4 python 1c_train_motion_prior_GRPO.py --config.experiment-name ours --config.dataset-hdf5-path ./data/egoalgo_no_skating_dataset.hdf5 --config.dataset-files-path ./data/egoalgo_no_skating_dataset_files.txt
+
+CUDA_VISIBLE_DEVICES=1 python 1c_train_motion_prior_GRPO.py --config.experiment-name debug_reward --config.dataset-hdf5-path ./data/egoalgo_no_skating_dataset.hdf5 --config.dataset-files-path ./data/egoalgo_no_skating_dataset_files.txt
 """
-
-
 
 import dataclasses
 import shutil
@@ -61,12 +61,12 @@ class EgoAlloTrainConfig:
     loss: training_loss.TrainingLossConfig = training_loss.TrainingLossConfig()
     
     # GRPO Group Size
-    group_size: int = 16
+    group_size: int = 24
     num_inner_epochs: int = 1
     eta : float = 0.9
     
     # Dataset arguments.
-    batch_size: int = 64
+    batch_size: int = 96
     """Effective batch size."""
     num_workers: int = 4
     subseq_len: int = 128

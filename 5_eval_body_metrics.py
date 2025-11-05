@@ -47,6 +47,7 @@ from egoallo.metrics_helpers import (
     compute_head_trans,
     compute_mpjpe,
     compute_mpjve,
+    compute_mpjre,
     jitter,
     compute_groundpenetrate,
     compute_footclipping,
@@ -65,7 +66,7 @@ def main(
     dataset_files_path: Path,
     subseq_len: int = 128,
     guidance_inner: bool = False,
-    checkpoint_dir: Path =  Path('/home/yaonanjie/project10/egoallo/experiments/ours/v1/checkpoints_300'), #Path("./egoallo_checkpoint_april13/checkpoints_3000000/"), #
+    checkpoint_dir: Path =  Path('/hpc2hdd/home/jren686/nanjie/egoallo/experiments/head+hands/v0/checkpoints_100000'), #Path("./egoallo_checkpoint_april13/checkpoints_3000000/"), #
     smplh_npz_path: Path = Path("./data/smplh/neutral/model.npz"), 
     num_samples: int = 1,
     save_visualizations: bool = True,
@@ -102,6 +103,7 @@ def main(
             guidance_inner=guidance_inner,
             guidance_post=False,
             Ts_world_cpf=sequence.T_world_cpf,
+            joints_wrt_cpf = sequence.joints_wrt_cpf,
             hamer_detections=None,
             aria_detections=None,
             num_samples=1,
@@ -199,6 +201,10 @@ def main(
                     pred_T_world_root=pred_posed.T_world_root,
                     pred_Ts_world_joint=pred_posed.Ts_world_joint[:, :, :21, :],
                 ),
+                "mpjre": compute_mpjre(
+                    pred_local_quats = pred_posed.local_quats[:, :, :21, :],
+                    label_local_quats = label_posed.local_quats[None, :, :21 ,:]
+                )
             }
         )
 

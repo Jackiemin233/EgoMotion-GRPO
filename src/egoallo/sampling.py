@@ -71,6 +71,7 @@ def run_sampling_with_stitching(
     guidance_inner: bool,
     Ts_world_cpf: Float[Tensor, "time 7"],
     floor_z: float,
+    joints_wrt_cpf: None | Float[Tensor, "time 21 3"],
     hamer_detections: None | CorrespondedHamerDetections,
     aria_detections: None | CorrespondedAriaHandWristPoseDetections,
     num_samples: int,
@@ -82,6 +83,11 @@ def run_sampling_with_stitching(
     # unoffset when returning.
     Ts_world_cpf_shifted = Ts_world_cpf.clone()
     Ts_world_cpf_shifted[..., 6] -= floor_z
+    
+    hand_positions_wrt_cpf: Tensor | None = None
+    if denoiser_network.config.include_hand_positions_cond:
+        # Joints 19 and 20 are the hand positions.
+        hand_positions_wrt_cpf = joints_wrt_cpf[:, 19:21, :].reshape((num_samples, -1, 6))
 
     noise_constants = CosineNoiseScheduleConstants.compute(timesteps=1000).to(
         device=device
@@ -127,8 +133,9 @@ def run_sampling_with_stitching(
         .to(device)
         .to(torch.float32)
     )
+    
     for i in tqdm(range(len(ts) - 1)):
-        print(f"Sampling {i}/{len(ts) - 1}")
+        #print(f"Sampling {i}/{len(ts) - 1}")
         t = ts[i]
         t_next = ts[i + 1]
 
@@ -156,7 +163,9 @@ def run_sampling_with_stitching(
                             None, start_t + 1 : end_t + 1, :
                         ].repeat((num_samples, 1, 1)),
                         project_output_rotmats=False,
-                        hand_positions_wrt_cpf=None,  # TODO: this should be filled in!!
+                        hand_positions_wrt_cpf=hand_positions_wrt_cpf[
+                            :, start_t:end_t, :
+                        ].repeat((num_samples, 1, 1)),  # TODO: this should be filled in!!
                         mask=None,
                     )
                     * overlap_weights_slice

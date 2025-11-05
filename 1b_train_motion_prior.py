@@ -1,4 +1,10 @@
-"""Training script for EgoAllo diffusion model using HuggingFace accelerate."""
+"""
+
+Training script for EgoAllo diffusion model using HuggingFace accelerate.
+
+CUDA_VISIBLE_DEVICES=0 python 1b_train_motion_prior.py --config.experiment-name head+hands --config.dataset-hdf5-path ./data/egoalgo_no_skating_dataset.hdf5 --config.dataset-files-path ./data/egoalgo_no_skating_dataset_files.txt --config.model.include-hand-positions-cond
+
+"""
 
 
 

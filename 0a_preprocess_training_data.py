@@ -60,6 +60,16 @@ AMASS_SPLITS = {
 }
 AMASS_SPLITS["all"] = AMASS_SPLITS["train"] + AMASS_SPLITS["val"] + AMASS_SPLITS["test"]
 
+RICH_SPLITS = {
+    "train":[
+        #"train"
+    ],
+    "test":[
+        "test"
+    ]
+}
+RICH_SPLITS["all"] = RICH_SPLITS["train"] + RICH_SPLITS["test"]
+
 
 def load_neutral_beta_conversion(gender: str) -> Tuple[np.ndarray, np.ndarray]:
     assert gender in ["female", "male"]
@@ -471,6 +481,60 @@ def load_seq_smpl_params(input_path: str, num_betas: int = 16):
     guru.info(f"model var shapes {str({k: v.shape for k, v in model_vars.items()})}")
     return model_vars, meta
 
+def load_seq_smpl_params_rich(input_path: str, num_betas: int = 10):
+    guru.info(f"Loading from {input_path}")
+    # load in input data
+    param_list = []
+    param_list.extend(map(str,Path(input_path).glob("**/*.pkl")))
+    
+    param_list.sort(key=lambda x: int(Path(x).parent.name))
+    
+    all_params = []
+    for pkl_file in param_list:
+        try:
+            all_params.append(np.load(pkl_file, allow_pickle=True))
+        except Exception as e:
+            guru.warning(f"Failed to load {pkl_file}: {e}")
+            
+    all_keys = set().union(*(params.keys() for params in all_params))
+    
+    bdata = {}
+    for key in all_keys:
+        arrays_to_concat = [params[key] for params in all_params if key in params]
+        if arrays_to_concat:
+            bdata[key] = np.concatenate(arrays_to_concat, axis=0)
+    
+    # we leave out "dmpls" and "marker_data"/"marker_label" which are not present in all datasets
+    #gender = np.array(bdata["gender"], ndmin=1)[0]
+    #gender = str(gender, "utf-8") if isinstance(gender, bytes) else str(gender)
+    fps = 30 #bdata["mocap_framerate"]
+    trans = bdata["transl"][:]  # global translation
+    num_frames = len(trans)
+    root_orient = bdata["global_orient"]  # global root orientation (1 joint)
+    pose_body = bdata["body_pose"]  # body joint rotations (21 joints)
+    pose_hand = bdata["poses"][:, 66:]  # finger articulation joint rotations
+    betas = np.tile(
+        bdata["betas"][None, :num_betas], [num_frames, 1]
+    )  # body shape parameters
+
+    # correct mislabeled data
+    if input_path.find("BMLhandball") >= 0:
+        fps = 240
+    if input_path.find("20160930_50032") >= 0 or input_path.find("20161014_50033") >= 0:
+        fps = 59
+
+    model_vars = {
+        "trans": trans,
+        "root_orient": root_orient,
+        "pose_body": pose_body,
+        "pose_hand": pose_hand,
+        "betas": betas,
+    }
+    meta = {"fps": fps, "gender": gender, "num_frames": num_frames}
+    guru.info(f"meta {meta}")
+    guru.info(f"model var shapes {str({k: v.shape for k, v in model_vars.items()})}")
+    return model_vars, meta
+
 
 def run_batch_smpl(
     body_model: BodyModel,
@@ -538,8 +602,37 @@ def process_seq(
     process_seq_data(
         model_vars, meta, out_path, dev_id, smplh_root, reflect=reflect, **kwargs
     )
+    
+def process_seq_rich(
+    input_path: str,
+    out_path: str,
+    smplh_root: str,
+    dev_id: int,
+    beta_neutral: bool,
+    reflect: bool = False,
+    overwrite: bool = False,
+    **kwargs,
+):
+    if not overwrite and os.path.isfile(out_path):
+        guru.info(f"{out_path} already exists, skipping.")
+        return
 
+    guru.info(f"process {input_path} to {out_path}")
 
+    model_vars, meta = load_seq_smpl_params_rich(input_path)
+
+    if beta_neutral:  # get the gender neutral beta
+        guru.info("converting betas to gender neutral")
+        A_beta, b_beta = load_neutral_beta_conversion(meta["gender"])
+        model_vars["betas"] = convert_gender_neutral_beta(
+            model_vars["betas"], A_beta, b_beta
+        )
+        meta["gender"] = "neutral"
+
+    process_seq_data(
+        model_vars, meta, out_path, dev_id, smplh_root, reflect=reflect, **kwargs
+    )
+    
 def process_seq_data(
     model_vars: Dict,
     meta: Dict,
@@ -729,6 +822,8 @@ def process_seq_data(
 class Config:
     data_root: str
     """Where the AMASS dataset is stored."""
+    data_root_rich: str = None
+    """Where the RICH dataset is stored."""
 
     smplh_root: str = "./data/smplh"
     out_root: str = "./data/processed_30fps_no_skating/"
@@ -745,16 +840,27 @@ def check_skip(path_name: str) -> bool:
         return True
     if "MPI_HDM05" in path_name and "dg/HDM_dg_07-01" in path_name:
         return True
+    if "./data/rich/test/LectureHall_009_021_reparingprojector1" in path_name:
+        return True
     return False
 
 
 def main(cfg: Config):
+    # Preprocessing for AMASS Dataset
     dsets = AMASS_SPLITS["all"]
     paths_to_process = []
     for dset in dsets:
         paths_to_process.extend(
             map(str, Path(f"{cfg.data_root}/{dset}").glob("**/*_poses.npz"))
         )
+
+    # Preprocessing for RICH Dataset
+    dset_RICH = RICH_SPLITS["all"]
+    paths_to_process_rich = []
+    for dset in dset_RICH:
+        paths_to_process_rich += os.listdir(Path(f"{cfg.data_root_rich}/{dset}"))
+        
+    paths_to_process_rich = [f'{cfg.data_root_rich}/{dset}/{path}' for path in paths_to_process_rich]
 
     dev_ids = cfg.devices
     guru.info(f"devices {dev_ids}")
@@ -787,6 +893,34 @@ def main(cfg: Config):
                 reflect=True,
                 overwrite=cfg.overwrite,
             )
+            
+        for i, path in tqdm(enumerate(paths_to_process_rich)):
+            if check_skip(path):
+                guru.info(f"skipping {path}")
+                continue
+            fname = path.split(cfg.data_root)[-1].rstrip("/")
+            ext = ".npz"
+            out_path = f"{cfg.out_root}/neutral/{fname}{ext}"
+            r_out_path = f"{cfg.out_root}/neutral/{fname}_reflect{ext}"
+            process_seq_rich(
+                path,
+                out_path,
+                cfg.smplh_root,
+                dev_ids[i % len(dev_ids)],
+                beta_neutral=True,
+                reflect=False,
+                overwrite=cfg.overwrite,
+            )
+            process_seq_rich(
+                path,
+                r_out_path,
+                cfg.smplh_root,
+                dev_ids[i % len(dev_ids)],
+                beta_neutral=True,
+                reflect=True,
+                overwrite=cfg.overwrite,
+            )    
+        
         return
 
     with ProcessPoolExecutor(max_workers=len(dev_ids)) as exe:

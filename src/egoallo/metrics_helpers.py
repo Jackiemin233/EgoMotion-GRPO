@@ -8,6 +8,7 @@ from typing_extensions import assert_never
 
 from .transforms import SO3
 
+
 ################################## Constant of Joint details ##################################
 JOINT_NAMES = [
     "Hips",
@@ -39,6 +40,34 @@ lower_index = [0, 1, 2, 4, 5, 7, 8]
 hand_index = [20, 21]
 foot_index = [7, 8]
 ################################## Constant of Joint details ##################################
+
+def quaternion_to_axis_angle(quaternions):
+    """
+    Convert rotations given as quaternions to axis/angle.
+    Args:
+        quaternions: quaternions with real part first,
+            as tensor of shape (..., 4).
+    Returns:
+        Rotations given as a vector in axis angle form, as a tensor
+            of shape (..., 3), where the magnitude is the angle
+            turned anticlockwise in radians around the vector's
+            direction.
+    """
+    norms = torch.norm(quaternions[..., 1:], p=2, dim=-1, keepdim=True)
+    half_angles = torch.atan2(norms, quaternions[..., :1])
+    angles = 2 * half_angles
+    eps = 1e-6
+    small_angles = angles.abs() < eps
+    sin_half_angles_over_angles = torch.empty_like(angles)
+    sin_half_angles_over_angles[~small_angles] = (
+        torch.sin(half_angles[~small_angles]) / angles[~small_angles]
+    )
+    # for x small, sin(x/2) is about x/2 - (x/2)^3/6
+    # so sin(x/2)/x is about 1/2 - (x*x)/48
+    sin_half_angles_over_angles[small_angles] = (
+        0.5 - (angles[small_angles] * angles[small_angles]) / 48
+    )
+    return quaternions[..., 1:] / sin_half_angles_over_angles
 
 def compute_foot_skate(
     pred_Ts_world_joint: Float[Tensor, "num_samples time 21 7"],
@@ -375,17 +404,25 @@ def jitter(
     return jitter
 
 def compute_mpjre(
-    label_T_world_root: Float[Tensor, "time 7"],
-    label_Ts_world_joint: Float[Tensor, "time 21 7"],
-    pred_T_world_root: Float[Tensor, "num_samples time 7"],
-    pred_Ts_world_joint: Float[Tensor, "num_samples time 21 7"],
+    pred_local_quats,
+    label_local_quats
 )-> np.ndarray:
-    diff = gt_angle - predicted_angle
+    diff = quaternion_to_axis_angle(pred_local_quats) - quaternion_to_axis_angle(label_local_quats)
     diff[diff > np.pi] = diff[diff > np.pi] - 2 * np.pi
     diff[diff < -np.pi] = diff[diff < -np.pi] + 2 * np.pi
     rot_error = torch.mean(torch.absolute(diff))
+    return rot_error.detach().cpu()
+
+def compute_mpjre_reward(
+    pred_local_quats,
+    label_local_quats,
+    metric_coefficient: float = 1000.0,
+) -> np.ndarray:
+    diff = quaternion_to_axis_angle(pred_local_quats) - quaternion_to_axis_angle(label_local_quats)
+    diff[diff > np.pi] = diff[diff > np.pi] - 2 * np.pi
+    diff[diff < -np.pi] = diff[diff < -np.pi] + 2 * np.pi
+    rot_error = torch.mean(torch.absolute(diff), dim = (-1,-2,-3)) * metric_coefficient
     return rot_error
-    
 
 def compute_mpjve(
     label_T_world_root: Float[Tensor, "time 7"],
@@ -516,10 +553,10 @@ def compute_groundpenetrate_reward(
 
     pred_joint_positions_height = pred_joint_positions[:, :, :, 2]
     
-    penetration_depth = torch.clamp(-pred_joint_positions_height, min=ground_height)
-    assert penetration_depth.shape == (num_samples, time, 22)
+    penetration_depth = torch.clamp(-torch.min(pred_joint_positions_height, dim = -1)[0], min=ground_height)
+    assert penetration_depth.shape == (num_samples, time)
 
-    gp_per_sample = torch.sum(penetration_depth, dim=(-1, -2)) * metric_coefficient
+    gp_per_sample = torch.sum(penetration_depth, dim=(-1)) * metric_coefficient
     assert gp_per_sample.shape == (num_samples,)
 
     return gp_per_sample

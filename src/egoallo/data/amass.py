@@ -24,12 +24,12 @@ AMASS_SPLITS = {
         "MPI_Limits",
         "TCD_handMocap",
         "TotalCapture",
-    ],
-    "val": [
-        "HumanEva",
         "MPI_HDM05",
         "MPI_mosh",
         "SFU",
+    ],
+    "val": [
+        "HumanEva",
     ],
     "test": [
         "Transitions_mocap",
