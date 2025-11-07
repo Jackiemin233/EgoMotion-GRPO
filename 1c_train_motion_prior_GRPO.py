@@ -9,7 +9,15 @@ CUDA_VISIBLE_DEVICES=4 1c_train_motion_prior_GRPO.py accelerate launch  --config
 
 CUDA_VISIBLE_DEVICES=4 python 1c_train_motion_prior_GRPO.py --config.experiment-name ours --config.dataset-hdf5-path ./data/egoalgo_no_skating_dataset.hdf5 --config.dataset-files-path ./data/egoalgo_no_skating_dataset_files.txt
 
-CUDA_VISIBLE_DEVICES=1 python 1c_train_motion_prior_GRPO.py --config.experiment-name debug_reward --config.dataset-hdf5-path ./data/egoalgo_no_skating_dataset.hdf5 --config.dataset-files-path ./data/egoalgo_no_skating_dataset_files.txt
+CUDA_VISIBLE_DEVICES=1 python 1c_train_motion_prior_GRPO.py --config.experiment-name debug_reward_noperceptual --config.dataset-hdf5-path ./data/egoalgo_no_skating_dataset.hdf5 --config.dataset-files-path ./data/egoalgo_no_skating_dataset_files.txt
+
+CUDA_VISIBLE_DEVICES=6 python 1c_train_motion_prior_GRPO.py --config.experiment-name debug_reward_noperceptual --config.dataset-hdf5-path ./data/egoalgo_no_skating_dataset.hdf5 --config.dataset-files-path ./data/egoalgo_no_skating_dataset_files.txt
+
+CUDA_VISIBLE_DEVICES=7 python 1c_train_motion_prior_GRPO.py --config.experiment-name debug_reward_withperceptual --config.dataset-hdf5-path ./data/egoalgo_no_skating_dataset.hdf5 --config.dataset-files-path ./data/egoalgo_no_skating_dataset_files.txt
+
+CUDA_VISIBLE_DEVICES=3 python 1c_train_motion_prior_GRPO.py --config.experiment-name debug_reward_withoutgp --config.dataset-hdf5-path ./data/egoalgo_no_skating_dataset.hdf5 --config.dataset-files-path ./data/egoalgo_no_skating_dataset_files.txt
+
+CUDA_VISIBLE_DEVICES=6 python 1c_train_motion_prior_GRPO.py --config.experiment-name debug_reward_onlyperceptual --config.dataset-hdf5-path ./data/egoalgo_no_skating_dataset.hdf5 --config.dataset-files-path ./data/egoalgo_no_skating_dataset_files.txt
 """
 
 import dataclasses
@@ -61,12 +69,12 @@ class EgoAlloTrainConfig:
     loss: training_loss.TrainingLossConfig = training_loss.TrainingLossConfig()
     
     # GRPO Group Size
-    group_size: int = 24
+    group_size: int = 16
     num_inner_epochs: int = 1
-    eta : float = 0.9
+    eta : float = 0.8
     
     # Dataset arguments.
-    batch_size: int = 96
+    batch_size: int = 64
     """Effective batch size."""
     num_workers: int = 4
     subseq_len: int = 128
@@ -252,6 +260,7 @@ def run_training(
             all_log_probs = []
             all_rewards = []
             all_samples = []
+            each_rewards = {}
             
             for i in tqdm(range(0, len(expanded_sequences), batch_size), desc=f'Sampling Epoch = {epoch}'): # 
                 current_batch = train_batch.slice_batch(slice(i, i+batch_size))
@@ -280,10 +289,16 @@ def run_training(
                 all_log_probs.append(log_probs)
                 all_rewards.append(rewards)
                 
+                if len(each_rewards) == 0:
+                    each_rewards = reward_dict
+                else:
+                    for k in reward_dict.keys():
+                        each_rewards[k] = torch.cat([each_rewards[k], reward_dict[k]], dim = 0)
+                   
                 torch.cuda.empty_cache()
                 
-            all_samples = torch.cat(all_samples, dim=0)
-            all_log_probs = torch.cat(all_log_probs, dim=0)
+            all_samples = torch.cat(all_samples, dim=0).detach()
+            all_log_probs = torch.cat(all_log_probs, dim=0).detach()
             all_rewards = torch.cat(all_rewards, dim=0).to(torch.float32)
             
             timesteps = quadratic_ts(return_tensor=True, set_final_step=True).to(device=device).repeat(config.batch_size * config.group_size, 1) 
@@ -379,13 +394,21 @@ def run_training(
                         
                 # Print status update to terminal.
                 mem_free, mem_total = torch.cuda.mem_get_info()
-                logger.info(
-                    #f"step: {step} ({loop_metrics.iterations_per_sec:.2f} it/sec)"
-                    f" mem: {(mem_total - mem_free) / 1024**3:.2f}/{mem_total / 1024**3:.2f}G"
-                    #f" lr: {scheduler.get_last_lr()[0]:.7f}"
-                    f" loss: {loss.item():.6f}"
-                    f" reward: {all_rewards.mean().item():.6f}"
-                )    
+                
+                if config.enable_reward_model and config.reward_model_path is not None:
+                    logger.info(
+                        #f"step: {step} ({loop_metrics.iterations_per_sec:.2f} it/sec)"
+                        f" mem: {(mem_total - mem_free) / 1024**3:.2f}/{mem_total / 1024**3:.2f}G"
+                        #f" lr: {scheduler.get_last_lr()[0]:.7f}"
+                        f" loss: {loss.item():.6f}"
+                        f" reward: {all_rewards.mean().item():.6f}"
+                        f" foot_skate_reward: {each_rewards['foot_skate_reward'].mean().item():.6f}"
+                        f" mpjpe_reward: {each_rewards['mpjpe_reward'].mean().item():.6f}"
+                        f" pampjpe_reward: {each_rewards['pampjpe_reward'].mean().item():.6f}"
+                        f" gp_reward: {each_rewards['gp_reward'].mean().item():.6f}"
+                        f" mpjve_reward: {each_rewards['mpjve_reward'].mean().item():.6f}"
+                        f" critic_score: {each_rewards['critic_score'].mean().item():.6f}"
+                    )    
 
             # Checkpointing.
             if epoch % config.save_ckpt_freq == 0:

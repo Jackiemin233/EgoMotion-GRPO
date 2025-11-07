@@ -132,7 +132,7 @@ def compute_rewards(samples, batch, body_model, reward_model = None) -> torch.Te
         label_Ts_world_joint=label_joints.Ts_world_joint[:, :, :21, :],
         pred_T_world_root=pred_joints.T_world_root,
         pred_Ts_world_joint=pred_joints.Ts_world_joint[:, :, :21, :],
-        metric_coefficient = 1000.0
+        metric_coefficient = 10.0
     )
     
     mpjre_reward = compute_mpjre_reward(
@@ -168,26 +168,28 @@ def compute_rewards(samples, batch, body_model, reward_model = None) -> torch.Te
         critic_input = torch.cat([pred_joints_axis_angle, root_xyz], dim=-2)
         critic_score = reward_model.module.batch_critic(critic_input).reshape(-1)
         reward_dict = {
-            "foot_skate_reward": foot_skate_reward,
-            "mpjpe_reward": mpjpe_reward,
-            "pampjpe_reward": pampjpe_reward,
+            "foot_skate_reward": foot_skate_reward.detach().cpu(),
+            "mpjpe_reward": mpjpe_reward.detach().cpu(),
+            "pampjpe_reward": pampjpe_reward.detach().cpu(),
             #"pred_jitter": pred_jitter,
-            "gp_reward": gp_reward,
-            "mpjve_reward": mpjve_reward,
+            "gp_reward": gp_reward.detach().cpu(),
+            "mpjve_reward": mpjve_reward.detach().cpu(),
             #"foot_contact_reward": foot_contact_reward,
-            "critic_score": critic_score
+            "critic_score": critic_score.detach().cpu()
         } 
-        reward = - (foot_skate_reward + mpjpe_reward + pampjpe_reward + gp_reward + mpjve_reward + mpjre_reward) + critic_score * 10 #+ foot_contact_reward 
+        reward = - (foot_skate_reward + mpjpe_reward + pampjpe_reward + mpjve_reward + mpjre_reward) + critic_score  #+ foot_contact_reward 
+        #reward = critic_score * 10 #- (foot_skate_reward + mpjpe_reward + pampjpe_reward + mpjve_reward + mpjre_reward) + critic_score  #+ foot_contact_reward 
+        
     else:
         reward_dict = {
-            "foot_skate_reward": foot_skate_reward,
-            "mpjpe_reward": mpjpe_reward,
-            "pampjpe_reward": pampjpe_reward,
+            "foot_skate_reward": foot_skate_reward.detach().cpu(),
+            "mpjpe_reward": mpjpe_reward.detach().cpu(),
+            "pampjpe_reward": pampjpe_reward.detach().cpu(),
             #"pred_jitter": pred_jitter,
-            "gp_reward": gp_reward,
-            "mpjve_reward": mpjve_reward,
+            "gp_reward": gp_reward.detach().cpu(),
+            "mpjve_reward": mpjve_reward.detach().cpu(),
             #"foot_contact_reward": foot_contact_reward
         } 
-        reward = - (foot_skate_reward + mpjpe_reward + pampjpe_reward + gp_reward + mpjve_reward + mpjre_reward) # + foot_contact_reward 
+        reward = - (foot_skate_reward + mpjpe_reward + pampjpe_reward + mpjve_reward + mpjre_reward) # + foot_contact_reward 
     
     return reward, reward_dict

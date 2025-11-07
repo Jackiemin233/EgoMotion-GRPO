@@ -6,8 +6,6 @@ CUDA_VISIBLE_DEVICES=0 python 1b_train_motion_prior.py --config.experiment-name 
 
 """
 
-
-
 import dataclasses
 import shutil
 from pathlib import Path
@@ -27,7 +25,6 @@ from egoallo.data.amass import EgoAmassHdf5Dataset
 from egoallo.data.dataclass import collate_dataclass
 
 from egoallo.inference_utils import load_denoiser
-
 
 @dataclasses.dataclass(frozen=True)
 class EgoAlloTrainConfig:

@@ -165,7 +165,7 @@ def run_sampling_with_stitching(
                         project_output_rotmats=False,
                         hand_positions_wrt_cpf=hand_positions_wrt_cpf[
                             :, start_t:end_t, :
-                        ].repeat((num_samples, 1, 1)),  # TODO: this should be filled in!!
+                        ].repeat((num_samples, 1, 1)) if hand_positions_wrt_cpf is not None else None,  # TODO: this should be filled in!!
                         mask=None,
                     )
                     * overlap_weights_slice

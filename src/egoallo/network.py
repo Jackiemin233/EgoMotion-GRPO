@@ -16,6 +16,7 @@ from .fncsmpl import SmplhModel, SmplhShapedAndPosed
 from .tensor_dataclass import TensorDataclass
 from .transforms import SE3, SO3
 
+from prope.torch import prope_dot_product_attention
 
 def project_rotmats_via_svd(
     rotmats: Float[Tensor, "*batch 3 3"],
@@ -484,7 +485,6 @@ class EgoDenoiser(nn.Module):
             assert_never(config.positional_encoding)
 
         encoder_out = self.latent_from_cond(cond) + pos_enc
-        #encoder_out = encoder_out.detach()
         decoder_out = x_t_encoded + pos_enc
 
         # Append the noise embedding to the encoder and decoder inputs.
@@ -521,9 +521,7 @@ class EgoDenoiser(nn.Module):
         for layer in self.encoder_layers:
             encoder_out = layer(encoder_out, attn_mask, noise_emb=noise_emb)
         for layer in self.decoder_layers:
-            decoder_out = layer(
-                decoder_out, attn_mask, noise_emb=noise_emb, cond=encoder_out
-            )
+            decoder_out = layer(decoder_out, attn_mask, noise_emb=noise_emb, cond=encoder_out)
 
         # Remove the extra token corresponding to the noise embedding.
         if self.noise_emb_token_proj is not None:
@@ -600,6 +598,7 @@ class TransformerBlockConfig:
     use_rope_embedding: bool
     use_film_noise_conditioning: bool
     xattn_mode: Literal["kv_from_cond_q_from_x", "kv_from_x_q_from_cond"]
+    include_tattn: bool = False
 
 
 class TransformerBlock(nn.Module):
@@ -629,6 +628,15 @@ class TransformerBlock(nn.Module):
             self.xattn_q_proj = nn.Linear(config.d_latent, config.d_latent, bias=False)
             self.xattn_layernorm = nn.LayerNorm(config.d_latent)
             self.xattn_out_proj = nn.Linear(
+                config.d_latent, config.d_latent, bias=False
+            )
+        
+        if config.include_tattn:
+            self.tattn_qkv_proj = nn.Linear(
+                config.d_latent, config.d_latent * 3, bias=False
+            )
+            self.tattn_layernorm = nn.LayerNorm(config.d_latent)
+            self.tattn_out_proj = nn.Linear(
                 config.d_latent, config.d_latent, bias=False
             )
 
@@ -667,6 +675,9 @@ class TransformerBlock(nn.Module):
         if config.include_xattn:
             assert cond is not None
             x = self.xattn_layernorm(x + self._xattn(x, attn_mask, cond=cond))
+            
+        if config.include_tattn:
+            x = self.tattn_layernorm(x + self._tattn(x, attn_mask))
 
         mlp_out = x
         mlp_out = self.mlp0(mlp_out)
@@ -689,14 +700,37 @@ class TransformerBlock(nn.Module):
         x = self.layernorm2(x + mlp_out)
         assert x.shape == (batch, time, d_latent)
         return x
-
+    
+    def _tattn(self, x: Tensor, attn_mask: Tensor | None) -> Tensor:
+        """ temporal-attention."""
+        config = self.config
+        
+        # temporal 
+        x = self.tattn_qkv_proj(rearrange(x, "b t n_dim -> t b n_dim"))
+        q, k, v = x.chunk(3, dim=-1)
+        
+        # embedding
+        if self.rotary_emb is not None:
+            q = self.rotary_emb.rotate_queries_or_keys(q, seq_dim=-2)
+            k = self.rotary_emb.rotate_queries_or_keys(k, seq_dim=-2)
+        # sdpa
+        x = torch.nn.functional.scaled_dot_product_attention(
+            q, k, v, dropout_p=config.dropout_p, attn_mask=None
+        )
+        x = self.dropout(x)
+        
+        x = rearrange(x, "t b n_dim -> b t n_dim")
+        x = self.tattn_out_proj(x)
+        return x
+        
+    
     def _sattn(self, x: Tensor, attn_mask: Tensor | None) -> Tensor:
         """Multi-head self-attention."""
         config = self.config
         q, k, v = rearrange(
             self.sattn_qkv_proj(x),
-            "b t (qkv nh dh) -> qkv b nh t dh",
-            qkv=3,
+            "b t (qkv nh dh) -> qkv b nh t dh", # 3 256 4 129 x
+            qkv=3, 
             nh=config.n_heads,
         )
         if self.rotary_emb is not None:

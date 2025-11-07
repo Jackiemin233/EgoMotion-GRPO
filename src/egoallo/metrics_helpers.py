@@ -405,12 +405,15 @@ def jitter(
 
 def compute_mpjre(
     pred_local_quats,
-    label_local_quats
+    label_local_quats,
+    return_degree = True
 )-> np.ndarray:
     diff = quaternion_to_axis_angle(pred_local_quats) - quaternion_to_axis_angle(label_local_quats)
     diff[diff > np.pi] = diff[diff > np.pi] - 2 * np.pi
     diff[diff < -np.pi] = diff[diff < -np.pi] + 2 * np.pi
     rot_error = torch.mean(torch.absolute(diff))
+    if return_degree:
+        return (rot_error / np.pi * 180).detach().cpu()
     return rot_error.detach().cpu()
 
 def compute_mpjre_reward(
@@ -421,7 +424,8 @@ def compute_mpjre_reward(
     diff = quaternion_to_axis_angle(pred_local_quats) - quaternion_to_axis_angle(label_local_quats)
     diff[diff > np.pi] = diff[diff > np.pi] - 2 * np.pi
     diff[diff < -np.pi] = diff[diff < -np.pi] + 2 * np.pi
-    rot_error = torch.mean(torch.absolute(diff), dim = (-1,-2,-3)) * metric_coefficient
+    rot_error = torch.mean(torch.absolute(diff), dim = (-1,-2,-3))
+    rot_error = (rot_error / np.pi * 180) * metric_coefficient
     return rot_error
 
 def compute_mpjve(
@@ -586,10 +590,10 @@ def compute_groundpenetrate(
 
     pred_joint_positions_height = pred_joint_positions[:, :, :, 2]
     
-    penetration_depth = torch.clamp(-pred_joint_positions_height, min=ground_height)
-    assert penetration_depth.shape == (num_samples, time, 22)
+    penetration_depth = torch.clamp(-torch.min(pred_joint_positions_height, dim = -1)[0], min=ground_height)
+    assert penetration_depth.shape == (num_samples, time)
 
-    gp_per_sample = torch.sum(penetration_depth, dim=(-1, -2))
+    gp_per_sample = torch.sum(penetration_depth, dim=(-1))
     assert gp_per_sample.shape == (num_samples,)
 
     return gp_per_sample.cpu().numpy()

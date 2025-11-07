@@ -60,13 +60,15 @@ from egoallo.rewardmodel import get_joints
 from egoallo.vis_helpers import vis_meshes_eval
 import os
 
+# Set manual random seed
+# torch.manual_seed(42)
 
 def main(
     dataset_hdf5_path: Path,
     dataset_files_path: Path,
     subseq_len: int = 128,
     guidance_inner: bool = False,
-    checkpoint_dir: Path =  Path('/hpc2hdd/home/jren686/nanjie/egoallo/experiments/head+hands/v0/checkpoints_100000'), #Path("./egoallo_checkpoint_april13/checkpoints_3000000/"), #
+    checkpoint_dir: Path = Path('./experiments/debug_reward_withoutgp/v0/checkpoints_100'), # Path("./egoallo_checkpoint_april13/checkpoints_3000000/"), # , #
     smplh_npz_path: Path = Path("./data/smplh/neutral/model.npz"), 
     num_samples: int = 1,
     save_visualizations: bool = True,
