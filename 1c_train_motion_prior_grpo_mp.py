@@ -17,13 +17,9 @@ CUDA_VISIBLE_DEVICES=7 python 1c_train_motion_prior_GRPO.py --config.experiment-
 
 CUDA_VISIBLE_DEVICES=3 python 1c_train_motion_prior_GRPO.py --config.experiment-name debug_reward_withoutgp --config.dataset-hdf5-path ./data/egoalgo_no_skating_dataset.hdf5 --config.dataset-files-path ./data/egoalgo_no_skating_dataset_files.txt
 
-CUDA_VISIBLE_DEVICES=0 python 1c_train_motion_prior_GRPO.py --config.experiment-name debug_reward_lr5e2 --config.dataset-hdf5-path ./data/egoalgo_no_skating_dataset.hdf5 --config.dataset-files-path ./data/egoalgo_no_skating_dataset_files.txt
+CUDA_VISIBLE_DEVICES=6 python 1c_train_motion_prior_GRPO.py --config.experiment-name debug_reward_onlyperceptual --config.dataset-hdf5-path ./data/egoalgo_no_skating_dataset.hdf5 --config.dataset-files-path ./data/egoalgo_no_skating_dataset_files.txt
 
-CUDA_VISIBLE_DEVICES=0 python 1c_train_motion_prior_GRPO.py --config.experiment-name debug_simplereward --config.dataset-hdf5-path ./data/egoalgo_no_skating_dataset.hdf5 --config.dataset-files-path ./data/egoalgo_no_skating_dataset_files.txt
-
-CUDA_VISIBLE_DEVICES=1 python 1c_train_motion_prior_GRPO.py --config.experiment-name debug_simplereward_justeva --config.dataset-hdf5-path ./data/egoalgo_no_skating_dataset.hdf5 --config.dataset-files-path ./data/egoalgo_no_skating_dataset_files.txt
-
-tensorboard --logdir ./
+CUDA_VISIBLE_DEVICES=1,2 accelerate launch --num_processes=2 --num_machines=1 --mixed_precision='no' --dynamo_backend='no'  1c_train_motion_prior_grpo_mp.py --config.experiment-name debug_reward_mp --config.dataset-hdf5-path ./data/egoalgo_no_skating_dataset.hdf5 --config.dataset-files-path ./data/egoalgo_no_skating_dataset_files.txt
 """
 
 import dataclasses
@@ -39,23 +35,25 @@ import yaml
 from accelerate import Accelerator, DataLoaderConfiguration
 from accelerate.utils import ProjectConfiguration, set_seed
 from loguru import logger
+import torch.distributed as dist
 
 from egoallo import network, training_loss, training_utils
 from egoallo.data.amass import EgoAmassHdf5Dataset
 from egoallo.data.dataclass import collate_dataclass
 
-from egoallo.sampling import run_sampling_with_logprob
+from egoallo.sampling_mp import run_sampling_with_logprob
 from egoallo.inference_utils import load_denoiser
 
 from egoallo import fncsmpl
 
 from egoallo.rewardmodel import compute_rewards
-from egoallo.sampling import CosineNoiseScheduleConstants, quadratic_ts
+from egoallo.sampling_mp import CosineNoiseScheduleConstants, quadratic_ts
 
 from egoallo.vis_helpers import vis_meshes
 
 from tqdm import tqdm
 import os
+import time
 
 # for reward model
 from thirdparty.MotionCritic.MotionCritic.lib.model.load_critic import load_critic
@@ -90,15 +88,12 @@ class EgoAlloTrainConfig:
         "train",
         "val",
     )
-    gradient_accumulation_steps = 1 # 8
+    seed = 42
+    gradient_accumulation_steps = 1
 
     # Optimizer options.
-    learning_rate: float = 1e-5 #0# 1e-5 #1e-5 #5e-2
-    adam_beta1 = 0.9
-    adam_beta2 = 0.999
-    adam_weight_decay = 1e-4
-    adam_epsilon = 1e-8
-    
+    learning_rate: float = 1e-3
+    weight_decay: float = 1e-4
     warmup_steps: int = 1000
     max_grad_norm: float = 1.0
     
@@ -112,11 +107,11 @@ class EgoAlloTrainConfig:
     fs_weight: float = 1.0
     critic_weight: float = 0.2
     
+    
     # training related 
     save_ckpt_freq = 100
     save_vis_freq = 5
-    seed: int = 42
-
+    
     # visualization related
     vis_interval = 20
     
@@ -142,7 +137,6 @@ def run_training(
     # Set up experiment directory + HF accelerate.
     # We're getting to manage logging, checkpoint directories, etc manually,
     # and just use `accelerate` for distibuted training.
-    
     experiment_dir = get_experiment_dir(config.experiment_name)
     assert not experiment_dir.exists()
     
@@ -156,15 +150,20 @@ def run_training(
         # the total number of optimizer steps to accumulate across.
         gradient_accumulation_steps=config.gradient_accumulation_steps * num_train_timesteps,
     )
-    
-    set_seed(config.seed, device_specific=True)
-    
     writer = (
         tensorboardX.SummaryWriter(logdir=str(experiment_dir), flush_secs=10)
         if accelerator.is_main_process
         else None
     )
     device = accelerator.device
+    
+    def gather_tensor(tensor):
+        if not dist.is_initialized():
+            return tensor
+        world_size = dist.get_world_size()
+        gathered_tensors = [torch.zeros_like(tensor) for _ in range(world_size)]
+        dist.all_gather(gathered_tensors, tensor)
+        return torch.cat(gathered_tensors, dim=0)
 
     # Initialize experiment.
     if accelerator.is_main_process:
@@ -191,41 +190,11 @@ def run_training(
 
         # Write logs to file.
         logger.add(experiment_dir / "trainlog.log", rotation="100 MB")
-        
-        # Train!
-        samples_per_epoch = (
-            config.batch_size
-            * accelerator.num_processes
-            * config.group_size
-        )
-        total_train_batch_size = (
-            config.batch_size
-            * accelerator.num_processes
-            * config.gradient_accumulation_steps
-        )
 
-        logger.info("***** Running training *****")
-        logger.info(f"  Sample batch size per device = {config.batch_size}")
-        logger.info(f"  Train batch size per device = {config.batch_size}")
-        logger.info(
-            f"  Gradient Accumulation steps = {config.gradient_accumulation_steps}"
-        )
-        logger.info("")
-        logger.info(f"  Total number of samples per epoch = {samples_per_epoch}")
-        logger.info(
-            f"  Total train batch size (w. parallel, distributed & accumulation) = {total_train_batch_size}"
-        )
-        logger.info(
-            f"  Number of gradient updates per inner epoch = {samples_per_epoch // total_train_batch_size}"
-        )
-        logger.info(f"  Number of inner epochs = {config.num_inner_epochs}")
-        
-
+    set_seed(config.seed, device_specific=True)
+    
     # Setup.
     model = load_denoiser(config.checkpoint_dir).to(device)
-    model.latent_from_cond.eval()
-    model.latent_from_cond.requires_grad_(False)  # Freeze conditional encoder.
-    
     logger.info("Loaded pretrained model from {}".format(config.checkpoint_dir))
     body_model = fncsmpl.SmplhModel.load(config.smplh_npz_path).to(device)
     
@@ -233,14 +202,14 @@ def run_training(
         dataset=EgoAmassHdf5Dataset(
             config.dataset_hdf5_path,
             config.dataset_files_path,
-            splits= ("just_TotalCapture",), #config.train_splits, # ("test",),
+            splits= config.train_splits, # ("test",),
             subseq_len=config.subseq_len,
             cache_files=True,
             slice_strategy=config.dataset_slice_strategy,
             random_variable_len_proportion=config.dataset_slice_random_variable_len_proportion,
         ),
         batch_size=config.batch_size,
-        shuffle = False, # TODO: Should be true for training
+        shuffle = True, # TODO: Should be true for training
         num_workers=config.num_workers,
         persistent_workers=config.num_workers > 0,
         pin_memory=True,
@@ -251,11 +220,10 @@ def run_training(
     optim = torch.optim.AdamW(  # type: ignore
         model.parameters(),
         lr=config.learning_rate,
-        betas=(config.adam_beta1, config.adam_beta2),
-        weight_decay=config.adam_weight_decay,
-        eps=config.adam_epsilon,
+        weight_decay=config.weight_decay,
     )
-
+    #model.latent_from_cond.requires_grad_(False)  # Freeze conditional encoder.
+    
     # import reward model
     if config.enable_reward_model and config.reward_model_path is not None:
         reward_model = load_critic("./data/motioncritic_pre.pth", device)
@@ -266,12 +234,24 @@ def run_training(
         reward_model = None
         logger.info("No reward model loaded.")
     
+    # scheduler = torch.optim.lr_scheduler.LambdaLR(
+    #     optim, lr_lambda=lambda step: min(1.0, step / config.warmup_steps)
+    # )
+    model.to(accelerator.device)
+    if reward_model is not None:
+        reward_model.to(accelerator.device)
+    
     # HF accelerate setup. We use this for parallelism, etc!
     model, train_loader, optim = accelerator.prepare(
         model, train_loader, optim
     )
     if reward_model is not None:
         reward_model = accelerator.prepare(reward_model)
+        
+    # model, train_loader, optim, scheduler = accelerator.prepare(
+    #     model, train_loader, optim, scheduler
+    # )
+    #accelerator.register_for_checkpointing(scheduler)
 
     # Restore an existing model checkpoint.
     if restore_checkpoint_dir is not None:
@@ -293,8 +273,8 @@ def run_training(
 
     # Run training loop!
     loss_helper = training_loss.TrainingLossComputer(config.loss, device=device)
-    
-    global_epoch = 0 
+    loop_metrics_gen = training_utils.loop_metric_generator(counter_init=epoch)
+    prev_checkpoint_path: Path | None = None
     while True:
         # GRPO Sampling
         for epoch, train_batch in enumerate(train_loader):
@@ -304,6 +284,7 @@ def run_training(
             batch_size = config.batch_size
             
             train_batch = train_batch.expand_sequence(config.group_size)
+            
             expanded_sequences = train_batch.T_world_cpf        
             
             all_log_probs = []
@@ -311,17 +292,8 @@ def run_training(
             all_samples = []
             each_rewards = {}
             
-            ###for the sake of convenience, we use the same latents for all prompts in a batch.
-            global_input_latents = torch.randn(
-                    (1, train_batch.T_world_cpf.shape[1] - 1, model.get_d_state()),
-                    device=accelerator.device,
-                )
-
-            for i in tqdm(range(0, len(expanded_sequences), batch_size), desc=f'Sampling Epoch = {global_epoch}'): # 
+            for i in tqdm(range(0, len(expanded_sequences), batch_size), desc=f'Sampling Epoch = {epoch}'): # 
                 current_batch = train_batch.slice_batch(slice(i, i+batch_size))
-                
-                if i % config.group_size == 0:
-                    input_latents = global_input_latents.repeat(batch_size,1,1).clone()
                 
                 samples, samples_packed, logprobs = run_sampling_with_logprob( # Samples -> all_latents
                     model,
@@ -335,13 +307,12 @@ def run_training(
                     device=device,
                     guidance_verbose=False,
                     return_packed=True,
-                    eta = config.eta,
-                    global_input_latent = input_latents
+                    eta = config.eta
                 )
                 
-                rewards, reward_dict = compute_rewards(samples, current_batch, body_model, config, reward_model)
-                log_probs = torch.stack(logprobs, dim=1).detach() # (4, num_steps, ...)
-                samples_packed = torch.stack(samples_packed, dim = 1).detach() # (4, num_steps+1, ...)
+                rewards, reward_dict = compute_rewards(samples, current_batch, body_model, config,  reward_model)
+                log_probs = torch.stack(logprobs, dim=1) # (4, num_steps, ...)
+                samples_packed = torch.stack(samples_packed, dim = 1) # (4, num_steps+1, ...)
                 
                 #all_samples.append(torch.cat(samples_packed, dim = 1))
                 all_samples.append(samples_packed)
@@ -356,11 +327,14 @@ def run_training(
                    
                 torch.cuda.empty_cache()
                 
-            all_samples = torch.cat(all_samples, dim=0)
-            all_log_probs = torch.cat(all_log_probs, dim=0)
+            all_samples = torch.cat(all_samples, dim=0).detach()
+            all_log_probs = torch.cat(all_log_probs, dim=0).detach()
             all_rewards = torch.cat(all_rewards, dim=0).to(torch.float32)
             
-            timesteps = quadratic_ts(return_tensor=True).to(device=device).repeat(config.batch_size * config.group_size, 1) 
+            timesteps = quadratic_ts(return_tensor=True, set_final_step=True).to(device=device).repeat(config.batch_size * config.group_size, 1) 
+            
+            time.sleep(0)
+            
             conditions = train_batch.T_world_cpf.to(device)
             
             if epoch % config.save_vis_freq == 0:
@@ -395,17 +369,17 @@ def run_training(
             # model training loop
             model.train()
             for inner_epoch in range(config.num_inner_epochs):
-                # perms = torch.stack(
-                #     [
-                #         torch.randperm(num_timesteps, device=accelerator.device)
-                #         for _ in range(total_batch_size)
-                #     ]
-                # )
-                # for key in ["timesteps", "packed_traj", "next_packed_traj", "log_probs"]:
-                #     samples_dict[key] = samples_dict[key][
-                #         torch.arange(total_batch_size, device=accelerator.device)[:, None],
-                #         perms,
-                #     ]
+                perms = torch.stack(
+                    [
+                        torch.randperm(num_timesteps, device=accelerator.device)
+                        for _ in range(total_batch_size)
+                    ]
+                )
+                for key in ["timesteps", "packed_traj", "next_packed_traj", "log_probs"]:
+                    samples_dict[key] = samples_dict[key][
+                        torch.arange(total_batch_size, device=accelerator.device)[:, None],
+                        perms,
+                    ]
 
                 # rebatch for training
                 samples_batched = {
@@ -426,12 +400,10 @@ def run_training(
                 ):
                     for j in tqdm(
                         range(num_timesteps),
-                        desc=f"Epoch {epoch}.{inner_epoch}: training Timestep",
+                        desc="Epoch {epoch}.{inner_epoch}: training Timestep",
                         position=1,
                         leave=False
                     ):
-                        # if j == 28:
-                        #     print('')
                         with accelerator.accumulate(model):
                             sample_timestep = {}
                             for k in sample.keys():
@@ -445,13 +417,13 @@ def run_training(
                                 model,
                                 unwrapped_model=accelerator.unwrap_model(model),
                                 sample_batch=sample_timestep,
-                                eta = config.eta
                             )
                     
                             accelerator.backward(loss)
                             if accelerator.sync_gradients:
                                 accelerator.clip_grad_norm_(model.parameters(), config.max_grad_norm)
                             optim.step()
+                            #scheduler.step()
                             optim.zero_grad()
                         
                 # Print status update to terminal.
@@ -469,18 +441,8 @@ def run_training(
                         f" pampjpe_reward: {each_rewards['pampjpe_reward'].mean().item():.6f}"
                         f" gp_reward: {each_rewards['gp_reward'].mean().item():.6f}"
                         f" mpjve_reward: {each_rewards['mpjve_reward'].mean().item():.6f}"
-                        f" mpjre_reward: {each_rewards['mpjre_reward'].mean().item():.6f}"
                         f" critic_score: {each_rewards['critic_score'].mean().item():.6f}"
                     )    
-                    writer.add_scalar('Loss/train', loss.item(), global_epoch)
-                    writer.add_scalar('Reward/reward', all_rewards.mean().item(), global_epoch)
-                    writer.add_scalar('Reward/foot_skate_reward', each_rewards['foot_skate_reward'].mean().item(), global_epoch)
-                    writer.add_scalar('Reward/mpjpe_reward', each_rewards['mpjpe_reward'].mean().item(), global_epoch)
-                    writer.add_scalar('Reward/pampjpe_reward', each_rewards['pampjpe_reward'].mean().item(), global_epoch)
-                    writer.add_scalar('Reward/mpjve_reward', each_rewards['mpjve_reward'].mean().item(), global_epoch)
-                    writer.add_scalar('Reward/mpjre_reward', each_rewards['mpjre_reward'].mean().item(), global_epoch)
-                
-                global_epoch += 1
 
             # Checkpointing.
             if epoch % config.save_ckpt_freq == 0:

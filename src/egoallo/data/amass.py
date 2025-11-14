@@ -44,6 +44,9 @@ AMASS_SPLITS = {
     "just_humaneva": [
         "HumanEva",
     ],
+    "just_TotalCapture": [
+        "TotalCapture",
+    ]
 }
 
 

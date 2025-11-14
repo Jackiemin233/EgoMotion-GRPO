@@ -101,7 +101,7 @@ class SE3(_base.SEBase[SO3]):
         t = self.translation().unsqueeze(-1)  # (*, 3, 1)
         dims = R.shape[:-2]
         bottom = (
-            torch.tensor([0, 0, 0, 1], dtype=R.dtype, device=R.device)
+            torch.tensor([0, 0, 0, 1], dtype=R.dtype, device=R.device) 
             .reshape(*(1,) * len(dims), 1, 4)
             .repeat(*dims, 1, 1)
         )

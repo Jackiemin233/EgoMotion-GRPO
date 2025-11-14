@@ -176,6 +176,7 @@ def compute_foot_contact_reward(
 def compute_foot_skate_reward(
     pred_Ts_world_joint: Float[Tensor, "num_samples time 21 7"],
     return_tensor: bool = False,
+    metric_coefficient: float = 1.0
 ) -> np.ndarray:
     (num_samples, time) = pred_Ts_world_joint.shape[:2]
 
@@ -217,6 +218,8 @@ def compute_foot_skate_reward(
         ),
         dim=-1,
     )
+    fs_per_sample = torch.exp(-metric_coefficient * fs_per_sample)
+    
     assert fs_per_sample.shape == (num_samples,)
 
     if return_tensor:
@@ -288,11 +291,11 @@ def compute_mpjpe_reward(
     assert position_differences.shape == (num_samples, time, 22, 3)
 
     # Per-joint position errors, in millimeters.
-    pjpe = torch.linalg.norm(position_differences, dim=-1) * metric_coefficient
+    pjpe = torch.linalg.norm(position_differences, dim=-1) 
     assert pjpe.shape == (num_samples, time, 22)
 
     # Mean per-joint position errors.
-    mpjpe = torch.mean(pjpe.reshape((num_samples, -1)), dim=-1)
+    mpjpe = torch.exp(-metric_coefficient * torch.mean(pjpe.reshape((num_samples, -1)), dim=-1))
     assert mpjpe.shape == (num_samples,)
 
     return mpjpe
@@ -419,13 +422,15 @@ def compute_mpjre(
 def compute_mpjre_reward(
     pred_local_quats,
     label_local_quats,
-    metric_coefficient: float = 1000.0,
+    metric_coefficient: float = 1.0,
 ) -> np.ndarray:
     diff = quaternion_to_axis_angle(pred_local_quats) - quaternion_to_axis_angle(label_local_quats)
     diff[diff > np.pi] = diff[diff > np.pi] - 2 * np.pi
     diff[diff < -np.pi] = diff[diff < -np.pi] + 2 * np.pi
     rot_error = torch.mean(torch.absolute(diff), dim = (-1,-2,-3))
-    rot_error = (rot_error / np.pi * 180) * metric_coefficient
+    
+    rot_error = torch.exp(-metric_coefficient * rot_error)
+    #rot_error = (rot_error / np.pi * 180) * metric_coefficient
     return rot_error
 
 def compute_mpjve(
@@ -465,7 +470,7 @@ def compute_mpjve_reward(
     label_Ts_world_joint: Float[Tensor, "time 21 7"],
     pred_T_world_root: Float[Tensor, "num_samples time 7"],
     pred_Ts_world_joint: Float[Tensor, "num_samples time 21 7"],
-    metric_coefficient: float = 1000.0,
+    metric_coefficient: float = 0.2,
     fps: int = 30
 ) -> np.ndarray:
 
@@ -484,9 +489,13 @@ def compute_mpjve_reward(
     label_velocity = (label_joint_positions[:, 1:, ...] - label_joint_positions[:, :-1, ...]) * fps
     pred_velocity = (pred_joint_positions[:, 1:, ...] - pred_joint_positions[:, :-1, ...]) * fps
     
-    ve = torch.mean(
-        torch.sqrt(torch.sum(torch.square(label_velocity - pred_velocity), axis=-1)), dim = (-1,-2)
-    ) * metric_coefficient
+    #torch.exp(-metric_coefficient * torch.mean(pjpe.reshape((num_samples, -1)), dim=-1))
+    
+    ve = torch.exp(- metric_coefficient * torch.mean(torch.sqrt(torch.sum(torch.square(label_velocity - pred_velocity), axis=-1)), dim = (-1,-2)))
+    
+    # ve = torch.mean(
+    #     torch.sqrt(torch.sum(torch.square(label_velocity - pred_velocity), axis=-1)), dim = (-1,-2)
+    # ) * metric_coefficient
     
     return ve
 

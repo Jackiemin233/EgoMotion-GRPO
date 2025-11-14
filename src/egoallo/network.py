@@ -16,7 +16,7 @@ from .fncsmpl import SmplhModel, SmplhShapedAndPosed
 from .tensor_dataclass import TensorDataclass
 from .transforms import SE3, SO3
 
-from prope.torch import prope_dot_product_attention
+#from prope.torch import prope_dot_product_attention
 
 def project_rotmats_via_svd(
     rotmats: Float[Tensor, "*batch 3 3"],

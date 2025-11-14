@@ -16,6 +16,9 @@ from .transforms import SO3, SE3
 
 import math
 
+def _left_broadcast(t, shape):
+    assert t.ndim <= len(shape)
+    return t.reshape(t.shape + (1,) * (len(shape) - t.ndim)).broadcast_to(shape)
 
 @dataclasses.dataclass(frozen=True)
 class TrainingLossConfig:
@@ -321,13 +324,15 @@ class TrainingLossComputer:
         model: network.EgoDenoiser | DistributedDataParallel | OptimizedModule,
         unwrapped_model: network.EgoDenoiser,
         sample_batch: EgoTrainingData,
+        eta : float,
+        floor_z: float = 0.0
     ):
-        
-        log_outputs: dict[str, Tensor | float] = {}
-        
+
         batch_size, seq_len, _ = sample_batch['packed_traj'].shape
         
         Ts_world_cpf = sample_batch['conditions']
+        Ts_world_cpf_shifted = Ts_world_cpf.clone()
+        Ts_world_cpf_shifted[..., 6] -= floor_z
         
         Ts_cpf_tm1_cpf_t = (
             SE3(Ts_world_cpf[..., :-1, :]).inverse() @ SE3(Ts_world_cpf[..., 1:, :])
@@ -342,15 +347,12 @@ class TrainingLossComputer:
         x_0_packed_pred = model.forward(
             x_t_packed=x_t_packed,
             t=sample_batch['timesteps'],
-            T_world_cpf=Ts_world_cpf[:, :-1], #[256, 128, 7]
-            T_cpf_tm1_cpf_t=Ts_cpf_tm1_cpf_t, #
+            T_cpf_tm1_cpf_t=Ts_cpf_tm1_cpf_t, 
+            T_world_cpf=Ts_world_cpf_shifted[:, 1:], #[256, 128, 7]
             hand_positions_wrt_cpf=None,
             project_output_rotmats=False,
-            mask=None, #train_batch.mask,
-            cond_dropout_keep_mask=torch.rand((batch_size,), device=device)
-            > self.config.cond_dropout_prob
-            if self.config.cond_dropout_prob > 0.0
-            else None,
+            mask=None,
+            cond_dropout_keep_mask = None
         )
         
         # compute the log prob of next_latents given latents under the current model
@@ -363,31 +365,26 @@ class TrainingLossComputer:
                 torch.sqrt(
                     (1.0 - alpha_bar_t[:-1]) / (1 - alpha_bar_t[1:]) * (1 - alpha_t)
                 )
-                * 0.8, # (hyperparameter: eta)
+                * eta, # (hyperparameter: eta)
             ]
         )
         
         t = sample_batch['timesteps'] # current timestep
-        t_next = torch.clamp(torch.sqrt(sample_batch['timesteps']).long() - 1, max=30) ** 2 # next timestep
+        t_next = torch.clamp(torch.sqrt(sample_batch['timesteps']).long() - 1, max=29, min = 0) ** 2 # next timestep
         
+        #  compute x_t without "random noise" of formula (12) from https://arxiv.org/pdf/2010.02502.pdf
+        # sigma_t[0] == sigma_t[1] = 0
         x_t_packed_wonoise = (
-            torch.sqrt(alpha_bar_t[t_next])[:,None, None] * x_0_packed_pred
+            torch.sqrt(alpha_bar_t[t_next, None, None]) * x_0_packed_pred
             + (
                 torch.sqrt(1 - alpha_bar_t[t_next] - sigma_t[t] ** 2)[:, None, None]
-                * (x_t_packed - torch.sqrt(alpha_bar_t[t])[:, None, None] * x_0_packed_pred)
+                * (x_t_packed - torch.sqrt(alpha_bar_t[t, None, None]) * x_0_packed_pred)
                 / torch.sqrt(1 - alpha_bar_t[t] + 1e-1)[:, None, None]
             )
-        )
+        )  # direction pointing to xt
         
-        x_t_packed = (
-            x_t_packed_wonoise
-            + sigma_t[t][:, None, None] * torch.randn(x_0_packed_pred.shape, device=device) # Random noise
-        )
-        
-        
-        # log prob of prev_sample given prev_sample_mean and Sigma_t
         log_prob = (
-            -((x_t_packed - x_t_packed_wonoise) ** 2) / (2 * (sigma_t[t] **2))[:, None, None]
+            -((sample_batch['next_packed_traj'].detach() - x_t_packed_wonoise) ** 2) / (2 * (sigma_t[t] **2))[:, None, None]
             - torch.log(sigma_t[t])[:, None, None]
             - torch.log(torch.sqrt(2 * torch.as_tensor(math.pi)))
         )
@@ -410,4 +407,4 @@ class TrainingLossComputer:
         )
         loss = torch.mean(torch.maximum(unclipped_loss, clipped_loss))
         
-        return loss#, ratio
+        return loss

@@ -182,7 +182,6 @@ def run_sampling_with_stitching(
 
         if torch.any(torch.isnan(x_0_packed_pred)):
             print("found nan", i)
-        
         sigma_t = torch.cat(
             [
                 torch.zeros((1,), device=device),
@@ -262,8 +261,7 @@ def run_sampling_with_logprob(
     device: torch.device,
     guidance_verbose: bool = True,
     return_packed: bool = False,
-    eta: float = 0.8,
-    global_input_latent : torch.Tensor | None = None
+    eta: float = 0.8
 ) -> network.EgoDenoiseTraj:
     batch_size = Ts_world_cpf.shape[0]
     Ts_world_cpf_shifted = Ts_world_cpf.clone()
@@ -278,18 +276,15 @@ def run_sampling_with_logprob(
     T_cpf_tm1_cpf_t = (
         SE3(Ts_world_cpf[..., :-1, :]).inverse() @ SE3(Ts_world_cpf[..., 1:, :])
     ).wxyz_xyz
-    
-    if global_input_latent is not None:
-        x_t_packed = global_input_latent
-    else:
-        x_t_packed = torch.randn(
-            (batch_size * num_samples, Ts_world_cpf.shape[1] - 1, denoiser_network.get_d_state()),
-            device=device, 
-        ) 
+
+    x_t_packed = torch.randn(
+        (batch_size * num_samples, Ts_world_cpf.shape[1] - 1, denoiser_network.module.get_d_state()),
+        device=device, 
+    ) 
     
     x_t_list = [ # unpacked tensor list
         network.EgoDenoiseTraj.unpack(
-            x_t_packed, include_hands=denoiser_network.config.include_hands
+            x_t_packed, include_hands=denoiser_network.module.config.include_hands
         )
     ]
     
@@ -357,7 +352,7 @@ def run_sampling_with_logprob(
             x_0_packed_pred /= overlap_weights
             x_0_packed_pred = network.EgoDenoiseTraj.unpack(
                 x_0_packed_pred.reshape(batch_size * num_samples, seq_len, -1),
-                include_hands=denoiser_network.config.include_hands,
+                include_hands=denoiser_network.module.config.include_hands,
                 project_rotmats=True,
             ).pack().reshape(batch_size * num_samples, seq_len, -1)
         
@@ -383,8 +378,10 @@ def run_sampling_with_logprob(
             ) # direction pointing to xt
         )
         
-        # x_t_packed -> prev_sample_mean
-        x_t_packed = (x_t_packed_wonoise + sigma_t[t] * torch.randn(x_0_packed_pred.shape, device=device)) # no noise at last timestep
+        x_t_packed = (
+            x_t_packed_wonoise
+            + sigma_t[t] * torch.randn(x_0_packed_pred.shape, device=device) # Random noise
+        ) # no noise at last timestep
     
         # Calculate the log probabilities
         # log prob of prev_sample given prev_sample_mean and Sigma_t 
@@ -400,7 +397,7 @@ def run_sampling_with_logprob(
         x_t_list.append(
             network.EgoDenoiseTraj.unpack(
                 x_t_packed.reshape(batch_size * num_samples, seq_len, -1), 
-                include_hands=denoiser_network.config.include_hands
+                include_hands=denoiser_network.module.config.include_hands
             )
         )
         x_t_packed_list.append(x_t_packed) # Packed tensor for each timestep
