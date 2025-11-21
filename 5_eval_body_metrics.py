@@ -67,8 +67,8 @@ def main(
     dataset_hdf5_path: Path,
     dataset_files_path: Path,
     subseq_len: int = 128,
-    guidance_inner: bool = False,
-    checkpoint_dir: Path = Path('./experiments/debug_reward_withoutgp/v0/checkpoints_100'), # Path("./egoallo_checkpoint_april13/checkpoints_3000000/"), # , #
+    guidance_inner: bool = False, #/home/yaonanjie/project10/egoallo/experiments/debug_1116/v0/checkpoints_200
+    checkpoint_dir: Path = Path('./experiments/debug_1116/v0/checkpoints_200'), # Path("./egoallo_checkpoint_april13/checkpoints_3000000/"), # , #
     smplh_npz_path: Path = Path("./data/smplh/neutral/model.npz"), 
     num_samples: int = 1,
     save_visualizations: bool = True,
@@ -89,7 +89,6 @@ def main(
         slice_strategy="deterministic",
         random_variable_len_proportion=0.0,
     )
-    
     
     body_model = fncsmpl.SmplhModel.load(smplh_npz_path).to(device)
 

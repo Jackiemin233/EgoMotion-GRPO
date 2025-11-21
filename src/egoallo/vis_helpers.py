@@ -667,7 +667,7 @@ def get_bodymesh_sample(samples, T_world_cpf, body_model):
         ).wxyz,
     )
     pred_posed = pred_posed.with_new_T_world_root(
-        get_T_world_root_from_cpf_pose(pred_posed, T_world_cpf[1:, ...])
+        get_T_world_root_from_cpf_pose(pred_posed, T_world_cpf)#[1:, ...])
     )
     
     pred_mesh = pred_posed.lbs()

@@ -252,7 +252,6 @@ def run_sampling_with_logprob(
     body_model: fncsmpl.SmplhModel,
     guidance_mode: GuidanceMode,
     Ts_world_cpf: Float[Tensor, "batch time 7"],
-    T_cpf_tm1_cpf_t: Float[Tensor, "batch time 7"],
     floor_z: float,
     hamer_detections: None | CorrespondedHamerDetections,
     aria_detections: None | CorrespondedAriaHandWristPoseDetections,
@@ -267,14 +266,15 @@ def run_sampling_with_logprob(
     Ts_world_cpf_shifted = Ts_world_cpf.clone()
     Ts_world_cpf_shifted[..., 6] -= floor_z
 
-    noise_constants = CosineNoiseScheduleConstants.compute(timesteps=1000).to(device=device).map(lambda tensor: tensor.to(torch.float32))
-    
+    noise_constants = CosineNoiseScheduleConstants.compute(timesteps=1000).to(
+        device=device
+    )
     alpha_bar_t = noise_constants.alpha_bar_t
     alpha_t = noise_constants.alpha_t
 
-    # T_cpf_tm1_cpf_t = (
-    #     SE3(Ts_world_cpf[..., :-1, :]).inverse() @ SE3(Ts_world_cpf[..., 1:, :])
-    # ).wxyz_xyz
+    T_cpf_tm1_cpf_t = (
+        SE3(Ts_world_cpf[..., :-1, :]).inverse() @ SE3(Ts_world_cpf[..., 1:, :])
+    ).wxyz_xyz
     
     if global_input_latent is not None:
         x_t_packed = global_input_latent
@@ -305,21 +305,33 @@ def run_sampling_with_logprob(
         t = ts[i] # [1000, 1] [1000, 4]
         t_next = ts[i + 1] # [841, 0] [1000, 1]
         
-        x_0_packed_pred = denoiser_network.forward(  # x_0_packed_pred: denoised trajectory
-            x_t_packed.reshape(batch_size * num_samples, window_size, -1), # x_t 
-            torch.tensor([t], device=device).expand((batch_size * num_samples,)), # noise level tensor
-            T_cpf_tm1_cpf_t=T_cpf_tm1_cpf_t.reshape(batch_size * num_samples, window_size, 7), # T_world_cpf [256, 127, 7]
-            T_world_cpf=Ts_world_cpf_shifted.reshape(batch_size * num_samples, window_size, 7),  # shifted T_world_cpf [256, 127, 7]
-            project_output_rotmats=False,
-            hand_positions_wrt_cpf=None,
-            mask=None,
-        )
+        x_0_packed_pred = torch.zeros_like(x_t_packed)
 
-        # x_0_packed_pred = network.EgoDenoiseTraj.unpack(
-        #     x_0_packed_pred.reshape(batch_size * num_samples, seq_len, -1),
-        #     include_hands=denoiser_network.config.include_hands,
-        #     project_rotmats=True,
-        # ).pack().reshape(batch_size * num_samples, seq_len, -1)
+        for start_t in range(0, seq_len, window_size - overlap_size):
+            end_t = min(start_t + window_size, seq_len)
+            assert end_t - start_t > 0
+            
+            x_0_packed_pred_ = denoiser_network.forward(  # x_0_packed_pred: denoised trajectory
+                x_t_packed[:, start_t:end_t, :].reshape(batch_size * num_samples, end_t - start_t, -1), # x_t 
+                
+                torch.tensor([t], device=device).expand((batch_size * num_samples,)), # noise level tensor
+                
+                T_cpf_tm1_cpf_t=T_cpf_tm1_cpf_t[:, start_t:end_t, :].reshape(batch_size * num_samples, end_t - start_t, 7), # T_world_cpf [256, 127, 7]
+                
+                T_world_cpf=Ts_world_cpf_shifted[:, start_t + 1 : end_t + 1, :].reshape(batch_size * num_samples, end_t - start_t, 7),  # shifted T_world_cpf [256, 127, 7]
+                
+                project_output_rotmats=False,
+                hand_positions_wrt_cpf=None,
+                mask=None,
+            )
+            
+            x_0_packed_pred[:, start_t:end_t, :] += x_0_packed_pred_.reshape(batch_size * num_samples, end_t - start_t, -1)
+
+        x_0_packed_pred = network.EgoDenoiseTraj.unpack(
+            x_0_packed_pred.reshape(batch_size * num_samples, seq_len, -1),
+            include_hands=denoiser_network.config.include_hands,
+            project_rotmats=True,
+        ).pack().reshape(batch_size * num_samples, seq_len, -1)
         
         # See formula (16) from https://arxiv.org/pdf/2010.02502.pdf
         sigma_t = torch.cat(
@@ -328,8 +340,9 @@ def run_sampling_with_logprob(
                 torch.sqrt(
                     (1.0 - alpha_bar_t[:-1]) / (1 - alpha_bar_t[1:]) * (1 - alpha_t)
                 )
-                * eta,  # (hyperparameter: eta)
-            ])
+                * eta, 
+            ]
+        )# (hyperparameter: eta)
             
         # See formula (12) from https://arxiv.org/pdf/2010.02502.pdf
         # DDIM process || x_t_packed is the x_{t-1} || prediction_type = sample

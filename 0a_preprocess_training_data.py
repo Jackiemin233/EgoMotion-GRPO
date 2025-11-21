@@ -518,10 +518,10 @@ def load_seq_smpl_params_rich(input_path: str, num_betas: int = 10):
     )  # body shape parameters
 
     # correct mislabeled data
-    if input_path.find("BMLhandball") >= 0:
-        fps = 240
-    if input_path.find("20160930_50032") >= 0 or input_path.find("20161014_50033") >= 0:
-        fps = 59
+    # if input_path.find("BMLhandball") >= 0:
+    #     fps = 240
+    # if input_path.find("20160930_50032") >= 0 or input_path.find("20161014_50033") >= 0:
+    #     fps = 59
 
     model_vars = {
         "trans": trans,

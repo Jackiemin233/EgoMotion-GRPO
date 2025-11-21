@@ -75,22 +75,22 @@ def get_joints(samples, batch, body_model):
         ).wxyz,
     )
     pred_posed = pred_posed_local.with_new_T_world_root(
-        get_T_world_root_from_cpf_pose(pred_posed_local, batch.T_world_cpf[:, 1:, ...])
+        get_T_world_root_from_cpf_pose(pred_posed_local, batch.T_world_cpf)#[:, 1:, ...])
     )
     
-    # gt
-    label_posed_local = body_model.with_shape(batch.betas[:, 1:, ...]).with_pose(
+    # gt batch.betas[:, 1:, ...]
+    label_posed_local = body_model.with_shape(batch.betas).with_pose(
         T_world_root=SE3.identity(device, torch.float32).wxyz_xyz,
         local_quats = torch.cat(
             [
-                batch.body_quats[:, 1:, ...],
-                batch.hand_quats[:, 1:, ...],
+                batch.body_quats,#[:, 1:, ...],
+                batch.hand_quats,#[:, 1:, ...],
             ],
             dim=2,
         ),
     )
     
-    label_posed = label_posed_local.with_new_T_world_root(batch.T_world_root[:, 1:, ...])
+    label_posed = label_posed_local.with_new_T_world_root(batch.T_world_root)#[:, 1:, ...])
     
     # label_posed = body_model.with_shape(batch.betas[:, 1:, ...]).with_pose(
     #     batch.T_world_root[:, 1:, ...],
@@ -113,6 +113,7 @@ def compute_rewards(samples, batch, body_model, config, reward_model = None) -> 
         samples: Tensor of shape (B, T, D) representing the generated motion samples.
         batch: Dictionary containing the batch data.
         body_model: The body model used for kinematic computations.
+        reward_model: Optinal external reward model
     """
     #samples = samples.unpack()
     
@@ -193,7 +194,7 @@ def compute_rewards(samples, batch, body_model, config, reward_model = None) -> 
         pred_joints_axis_angle = quaternion_to_axis_angle(pred_joints_quaternion)
         root_xyz = pred_joints.T_world_root[:, :, None, 4:]
         critic_input = torch.cat([pred_joints_axis_angle, root_xyz], dim=-2)
-        critic_score = torch.exp(reward_model.module.batch_critic(critic_input).reshape(-1) * config.critic_weight)
+        critic_score = torch.exp(config.critic_weight * reward_model.module.batch_critic(critic_input).reshape(-1))
         reward_dict = {
             "foot_skate_reward": foot_skate_reward.detach().cpu(),
             "mpjpe_reward": mpjpe_reward.detach().cpu(),
@@ -205,8 +206,7 @@ def compute_rewards(samples, batch, body_model, config, reward_model = None) -> 
             "critic_score": critic_score.detach().cpu(),
             "mpjre_reward": mpjre_reward.detach().cpu()
         } 
-        reward = mpjpe_reward # mpjpe_reward + pampjpe_reward + mpjve_reward + mpjre_reward  # + critic_score  foot_skate_reward +  #+ foot_contact_reward 
-        #reward = critic_score * 10 #- (foot_skate_reward + mpjpe_reward + pampjpe_reward + mpjve_reward + mpjre_reward) + critic_score  #+ foot_contact_reward 
+        reward = mpjpe_reward + pampjpe_reward + mpjve_reward + mpjre_reward  + critic_score + foot_skate_reward #+ foot_contact_reward 
         
     else:
         reward_dict = {

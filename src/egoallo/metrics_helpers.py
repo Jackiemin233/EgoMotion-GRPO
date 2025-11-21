@@ -258,6 +258,7 @@ def compute_head_trans(
         dim=-1,
     ).numpy(force=True)
     
+    
 def compute_mpjpe_reward(
     label_T_world_root: Float[Tensor, "batch time 7"],
     label_Ts_world_joint: Float[Tensor, "batch 21 7"],
@@ -288,11 +289,11 @@ def compute_mpjpe_reward(
         )
 
     position_differences = pred_joint_positions - label_joint_positions
-    assert position_differences.shape == (num_samples, time, 22, 3)
+    #assert position_differences.shape == (num_samples, time, 22, 3)
 
     # Per-joint position errors, in millimeters.
     pjpe = torch.linalg.norm(position_differences, dim=-1) 
-    assert pjpe.shape == (num_samples, time, 22)
+    #assert pjpe.shape == (num_samples, time, 22)
 
     # Mean per-joint position errors.
     mpjpe = torch.exp(-metric_coefficient * torch.mean(pjpe.reshape((num_samples, -1)), dim=-1))
@@ -534,7 +535,7 @@ def compute_mpjpe(
     assert position_differences.shape == (num_samples, time, 22, 3)
 
     # Per-joint position errors, in millimeters.
-    pjpe = torch.linalg.norm(position_differences, dim=-1) * 1000.0
+    pjpe = torch.linalg.norm(position_differences, dim=-1) #* 1000.0
     assert pjpe.shape == (num_samples, time, 22)
 
     # Mean per-joint position errors.

@@ -23,6 +23,17 @@ CUDA_VISIBLE_DEVICES=0 python 1c_train_motion_prior_GRPO.py --config.experiment-
 
 CUDA_VISIBLE_DEVICES=1 python 1c_train_motion_prior_GRPO.py --config.experiment-name debug_simplereward_justeva --config.dataset-hdf5-path ./data/egoalgo_no_skating_dataset.hdf5 --config.dataset-files-path ./data/egoalgo_no_skating_dataset_files.txt
 
+
+
+
+CUDA_VISIBLE_DEVICES=2 python 1c_train_motion_prior_grpo.py --config.experiment-name debug_mpjpe_100 --config.dataset-hdf5-path ./data/egoalgo_no_skating_dataset.hdf5 --config.dataset-files-path ./data/egoalgo_no_skating_dataset_files.txt
+
+CUDA_VISIBLE_DEVICES=7 python 1c_train_motion_prior_grpo.py --config.experiment-name debug_mpjpe_pampjpe_100 --config.dataset-hdf5-path ./data/egoalgo_no_skating_dataset.hdf5 --config.dataset-files-path ./data/egoalgo_no_skating_dataset_files.txt
+
+CUDA_VISIBLE_DEVICES=7 python 1c_train_motion_prior_grpo.py --config.experiment-name baseline --config.dataset-hdf5-path ./data/egoalgo_no_skating_dataset.hdf5 --config.dataset-files-path ./data/egoalgo_no_skating_dataset_files.txt
+
+CUDA_VISIBLE_DEVICES=7 python 1c_train_motion_prior_grpo.py --config.experiment-name baseline_wofs --config.dataset-hdf5-path ./data/egoalgo_no_skating_dataset.hdf5 --config.dataset-files-path ./data/egoalgo_no_skating_dataset_files.txt
+
 tensorboard --logdir ./
 """
 
@@ -93,7 +104,7 @@ class EgoAlloTrainConfig:
     gradient_accumulation_steps = 1 # 8
 
     # Optimizer options.
-    learning_rate: float = 1e-5 #0# 1e-5 #1e-5 #5e-2
+    learning_rate: float = 1e-5 #1e-5 #1e-5 #5e-2
     adam_beta1 = 0.9
     adam_beta2 = 0.999
     adam_weight_decay = 1e-4
@@ -106,10 +117,10 @@ class EgoAlloTrainConfig:
     enable_reward_model: bool = True
     reward_model_path: str = "./data/motioncritic_pre.pth"
     
-    pose_weight: float = 100.0
+    pose_weight: float = 1.0 #100.0
     velocity_weight: float = 0.2
     rotation_weight: float = 1.0
-    fs_weight: float = 1.0
+    fs_weight: float = 0#1.0
     critic_weight: float = 0.2
     
     # training related 
@@ -233,14 +244,14 @@ def run_training(
         dataset=EgoAmassHdf5Dataset(
             config.dataset_hdf5_path,
             config.dataset_files_path,
-            splits= ("just_TotalCapture",), #config.train_splits, # ("test",),
+            splits= config.train_splits, # ("test",),("just_TotalCapture",), #
             subseq_len=config.subseq_len,
             cache_files=True,
             slice_strategy=config.dataset_slice_strategy,
             random_variable_len_proportion=config.dataset_slice_random_variable_len_proportion,
         ),
         batch_size=config.batch_size,
-        shuffle = False, # TODO: Should be true for training
+        shuffle = True, # TODO: Should be true for training
         num_workers=config.num_workers,
         persistent_workers=config.num_workers > 0,
         pin_memory=True,
@@ -313,7 +324,7 @@ def run_training(
             
             ###for the sake of convenience, we use the same latents for all prompts in a batch.
             global_input_latents = torch.randn(
-                    (1, train_batch.T_world_cpf.shape[1] - 1, model.get_d_state()),
+                    (1, train_batch.T_world_cpf.shape[1], model.get_d_state()),
                     device=accelerator.device,
                 )
 
@@ -323,29 +334,30 @@ def run_training(
                 if i % config.group_size == 0:
                     input_latents = global_input_latents.repeat(batch_size,1,1).clone()
                 
-                samples, samples_packed, logprobs = run_sampling_with_logprob( # Samples -> all_latents
-                    model,
-                    body_model=body_model,
-                    guidance_mode="no_hands",
-                    Ts_world_cpf=current_batch.T_world_cpf,
-                    hamer_detections=None,
-                    aria_detections=None,
-                    num_samples=1,
-                    floor_z=0.0,
-                    device=device,
-                    guidance_verbose=False,
-                    return_packed=True,
-                    eta = config.eta,
-                    global_input_latent = input_latents
-                )
+                with torch.no_grad():
+                    samples, samples_packed, logprobs = run_sampling_with_logprob( # Samples -> all_latents
+                        model,
+                        body_model=body_model,
+                        guidance_mode="no_hands",
+                        Ts_world_cpf=current_batch.T_world_cpf,
+                        T_cpf_tm1_cpf_t=current_batch.T_cpf_tm1_cpf_t,
+                        hamer_detections=None,
+                        aria_detections=None,
+                        num_samples=1,
+                        floor_z=0.0,
+                        device=device,
+                        guidance_verbose=False,
+                        return_packed=True,
+                        eta = config.eta,
+                        global_input_latent = input_latents
+                    )
                 
                 rewards, reward_dict = compute_rewards(samples, current_batch, body_model, config, reward_model)
                 log_probs = torch.stack(logprobs, dim=1).detach() # (4, num_steps, ...)
                 samples_packed = torch.stack(samples_packed, dim = 1).detach() # (4, num_steps+1, ...)
                 
-                #all_samples.append(torch.cat(samples_packed, dim = 1))
-                all_samples.append(samples_packed)
                 all_log_probs.append(log_probs)
+                all_samples.append(samples_packed)
                 all_rewards.append(rewards)
                 
                 if len(each_rewards) == 0:
@@ -353,21 +365,23 @@ def run_training(
                 else:
                     for k in reward_dict.keys():
                         each_rewards[k] = torch.cat([each_rewards[k], reward_dict[k]], dim = 0)
-                   
-                torch.cuda.empty_cache()
                 
+                torch.cuda.empty_cache()
+                    
             all_samples = torch.cat(all_samples, dim=0)
             all_log_probs = torch.cat(all_log_probs, dim=0)
             all_rewards = torch.cat(all_rewards, dim=0).to(torch.float32)
             
             timesteps = quadratic_ts(return_tensor=True).to(device=device).repeat(config.batch_size * config.group_size, 1) 
-            conditions = train_batch.T_world_cpf.to(device)
+            conditions_T_world_cpf = train_batch.T_world_cpf.to(device).to(torch.float32)
+            conditions_T_cpf_tm1_cpf_t = train_batch.T_cpf_tm1_cpf_t.to(device).to(torch.float32)
             
             if epoch % config.save_vis_freq == 0:
-                vis_meshes(all_samples, conditions, body_model, config.vis_interval, save_path = f'{experiment_dir}/visualization/{epoch}.obj')
+                vis_meshes(all_samples, conditions_T_world_cpf, body_model, config.vis_interval, save_path = f'{experiment_dir}/visualization/{epoch}.obj')
             
             samples_dict={
-                "conditions": conditions, # [batch, seq_len, 7]
+                "conditions_T_world_cpf": conditions_T_world_cpf, # [batch, seq_len, 7]
+                "conditions_T_cpf_tm1_cpf_t": conditions_T_cpf_tm1_cpf_t, 
                 "timesteps": timesteps[:, :-2], # [batch, 29]
                 "packed_traj": all_samples[:, :-1][:, :-1],  # each entry is the latent before timestep t (0, 29) 
                 "next_packed_traj": all_samples[:, 1:][:, :-1],  # each entry is the latent after timestep t (1, 30)
@@ -382,6 +396,8 @@ def run_training(
             for i in range(n): 
                 start_idx = i * config.group_size
                 end_idx = (i + 1) * config.group_size
+                # Each reward group normalization
+                
                 group_rewards = all_rewards[start_idx:end_idx]
                 group_mean = group_rewards.mean()
                 group_std = group_rewards.std() + 1e-8
@@ -395,19 +411,19 @@ def run_training(
             # model training loop
             model.train()
             for inner_epoch in range(config.num_inner_epochs):
-                # perms = torch.stack(
-                #     [
-                #         torch.randperm(num_timesteps, device=accelerator.device)
-                #         for _ in range(total_batch_size)
-                #     ]
-                # )
-                # for key in ["timesteps", "packed_traj", "next_packed_traj", "log_probs"]:
-                #     samples_dict[key] = samples_dict[key][
-                #         torch.arange(total_batch_size, device=accelerator.device)[:, None],
-                #         perms,
-                #     ]
+                perms = torch.stack(
+                    [
+                        torch.randperm(num_timesteps, device=accelerator.device)
+                        for _ in range(total_batch_size)
+                    ]
+                )
+                for key in ["timesteps", "packed_traj", "next_packed_traj", "log_probs"]:
+                    samples_dict[key] = samples_dict[key][
+                        torch.arange(total_batch_size, device=accelerator.device)[:, None],
+                        perms,
+                    ]
 
-                # rebatch for training
+                # # rebatch for training
                 samples_batched = {
                     k: v.reshape(-1, config.batch_size, *v.shape[1:])
                     for k, v in samples_dict.items()
@@ -430,8 +446,6 @@ def run_training(
                         position=1,
                         leave=False
                     ):
-                        # if j == 28:
-                        #     print('')
                         with accelerator.accumulate(model):
                             sample_timestep = {}
                             for k in sample.keys():
@@ -445,8 +459,7 @@ def run_training(
                                 model,
                                 unwrapped_model=accelerator.unwrap_model(model),
                                 sample_batch=sample_timestep,
-                                eta = config.eta
-                            )
+                                eta = config.eta)
                     
                             accelerator.backward(loss)
                             if accelerator.sync_gradients:
